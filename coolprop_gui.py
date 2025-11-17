@@ -1,15 +1,19 @@
 # -*- coding: utf-8 -*-
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+import tkinter.simpledialog as simpledialog
+import copy
 import CoolProp.CoolProp as CP
 import sys
 import time
 import traceback
 import webbrowser
+import threading
 from collections import namedtuple
 import configparser
 import os
 import logging
+import json
 from math import isnan
 
 # --- Pint Import ---
@@ -112,6 +116,30 @@ class ThermodynamicsCalculator:
     def __init__(self):
         self.ureg = ureg
         self.Q_ = Q_
+        # Simple in-memory cache for expensive calculations keyed by (name, params...)
+        self._cache = {}
+
+    def _cache_get(self, key):
+        try:
+            return copy.deepcopy(self._cache.get(key))
+        except Exception:
+            return None
+
+    def _cache_set(self, key, value):
+        try:
+            self._cache[key] = copy.deepcopy(value)
+        except Exception:
+            pass
+
+    def clear_cache(self, fluid_key=None):
+        """Clear cache entirely or only entries related to a given fluid_key string."""
+        if fluid_key is None:
+            self._cache.clear(); return
+        # remove any keys that contain the fluid_key
+        keys_to_rm = [k for k in list(self._cache.keys()) if isinstance(k, tuple) and any(fluid_key in str(p) for p in k)]
+        for k in keys_to_rm:
+            try: del self._cache[k]
+            except Exception: pass
 
     def get_fluid_list(self):
         try:
@@ -189,6 +217,10 @@ class ThermodynamicsCalculator:
 
     # --- Dome Calculation Methods ---
     def calculate_ph_dome(self, fluid_name):
+        cache_key = ('ph_dome', fluid_name)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         dome_data = {'p': None, 'h_liq': None, 'h_vap': None, 'crit_point': None, 'error': None}
         logging.info(f"Calculating P-h dome for {fluid_name}...")
         N = 100
@@ -225,9 +257,16 @@ class ThermodynamicsCalculator:
              error_msg = f"P-h Dome Calculation Error: {e_calc}"; logging.error(f"{error_msg} for fluid {fluid_name}", exc_info=False); dome_data['error'] = error_msg
         except Exception as e_glob:
              error_msg = f"Unexpected P-h Dome Error: {e_glob}"; logging.error(f"{error_msg} for fluid {fluid_name}", exc_info=True); dome_data['error'] = error_msg
+        # cache and return
+        try: self._cache_set(cache_key, dome_data)
+        except: pass
         return dome_data
 
     def calculate_ts_dome(self, fluid_name):
+        cache_key = ('ts_dome', fluid_name)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         dome_data = {'t': None, 's_liq': None, 's_vap': None, 'crit_point': None, 'error': None}
         logging.info(f"Calculating T-s dome for {fluid_name}...")
         N = 100
@@ -263,10 +302,16 @@ class ThermodynamicsCalculator:
              error_msg = f"T-s Dome Calculation Error: {e_calc}"; logging.error(f"{error_msg} for fluid {fluid_name}", exc_info=False); dome_data['error'] = error_msg
         except Exception as e_glob:
              error_msg = f"Unexpected T-s Dome Error: {e_glob}"; logging.error(f"{error_msg} for fluid {fluid_name}", exc_info=True); dome_data['error'] = error_msg
+        try: self._cache_set(cache_key, dome_data)
+        except: pass
         return dome_data
 
     # --- Isotherm/Isobar Calculation Methods ---
     def calculate_ph_isotherm(self, fluid_name, temp_k, num_points=50):
+        cache_key = ('ph_isotherm', fluid_name, float(temp_k), int(num_points))
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         isotherm_data = {'p': [], 'h': [], 'error': None}
         logging.info(f"Calculating P-h isotherm for {fluid_name} at T={temp_k:.2f} K...")
         try:
@@ -303,9 +348,15 @@ class ThermodynamicsCalculator:
             error_msg = f"P-h Isotherm Calc Error (T={temp_k:.2f} K): {e_calc}"; logging.error(f"{error_msg} for fluid {fluid_name}", exc_info=False); isotherm_data['error'] = error_msg
         except Exception as e_glob:
             error_msg = f"Unexpected P-h Isotherm Error (T={temp_k:.2f} K): {e_glob}"; logging.error(f"{error_msg} for fluid {fluid_name}", exc_info=True); isotherm_data['error'] = error_msg
+        try: self._cache_set(cache_key, isotherm_data)
+        except: pass
         return isotherm_data
 
     def calculate_ts_isobar(self, fluid_name, press_pa, num_points=50):
+        cache_key = ('ts_isobar', fluid_name, float(press_pa), int(num_points))
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         isobar_data = {'t': [], 's': [], 'error': None}
         logging.info(f"Calculating T-s isobar for {fluid_name} at P={press_pa/1e3:.2f} kPa...")
         try:
@@ -344,6 +395,8 @@ class ThermodynamicsCalculator:
             error_msg = f"T-s Isobar Calc Error (P={press_pa/1e3:.2f} kPa): {e_calc}"; logging.error(f"{error_msg} for fluid {fluid_name}", exc_info=False); isobar_data['error'] = error_msg
         except Exception as e_glob:
             error_msg = f"Unexpected T-s Isobar Error (P={press_pa/1e3:.2f} kPa): {e_glob}"; logging.error(f"{error_msg} for fluid {fluid_name}", exc_info=True); isobar_data['error'] = error_msg
+        try: self._cache_set(cache_key, isobar_data)
+        except: pass
         return isobar_data
 
     # --- Rankine Cycle Calculation ---
@@ -402,6 +455,10 @@ class ThermodynamicsCalculator:
     # --- NEW: P-T Saturation Curve Calculation ---
     def calculate_psat_vs_t(self, fluid_name, num_points=100):
         """ Calculates P-T saturation line from triple point to critical point. """
+        cache_key = ('psat_vs_t', fluid_name, int(num_points))
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         psat_data = {'t': None, 'p': None, 'error': None}
         logging.info(f"Calculating P-T saturation curve for {fluid_name}...")
         try:
@@ -427,6 +484,8 @@ class ThermodynamicsCalculator:
              error_msg = f"P-T Curve Calc Error: {e_calc}"; logging.error(f"{error_msg} for fluid {fluid_name}", exc_info=False); psat_data['error'] = error_msg
         except Exception as e_glob:
              error_msg = f"Unexpected P-T Curve Error: {e_glob}"; logging.error(f"{error_msg} for fluid {fluid_name}", exc_info=True); psat_data['error'] = error_msg
+        try: self._cache_set(cache_key, psat_data)
+        except: pass
         return psat_data
 
     def calculate_quality_curves_ph(self, fluid_name, x_list=None, N=80):
@@ -435,6 +494,10 @@ class ThermodynamicsCalculator:
         """
         if x_list is None: x_list = [i/10.0 for i in range(1, 10)]
         res = {'x_lines': {}, 'error': None}
+        cache_key = ('quality_ph', fluid_name, tuple(x_list) if x_list is not None else None, int(N))
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         try:
             pcrit_si = CP.PropsSI('Pcrit', fluid_name)
             try: pmin_si = CP.PropsSI('Pmin', fluid_name)
@@ -459,6 +522,8 @@ class ThermodynamicsCalculator:
                     res['x_lines'][x] = {'h': h_arr, 'p': p_arr}
         except Exception as e:
             res['error'] = f"Quality curve error: {e}"
+        try: self._cache_set(cache_key, res)
+        except: pass
         return res
 
     def calculate_quality_curves_ts(self, fluid_name, x_list=None, N=80):
@@ -467,6 +532,10 @@ class ThermodynamicsCalculator:
         """
         if x_list is None: x_list = [i/10.0 for i in range(1, 10)]
         res = {'x_lines': {}, 'error': None}
+        cache_key = ('quality_ts', fluid_name, tuple(x_list) if x_list is not None else None, int(N))
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         try:
             tcrit_si = CP.PropsSI('Tcrit', fluid_name)
             try: tmin_si = CP.PropsSI('Tmin', fluid_name)
@@ -491,6 +560,8 @@ class ThermodynamicsCalculator:
                     res['x_lines'][x] = {'s': s_arr, 't': t_arr}
         except Exception as e:
             res['error'] = f"Quality curve error: {e}"
+        try: self._cache_set(cache_key, res)
+        except: pass
         return res
     # --- NEW: Refrigeration Cycle Calculation ---
     def calculate_refrigeration_cycle(self, fluid_name, p_evap_pa, p_cond_pa, superheat_k, subcooling_k, eta_compressor):
@@ -588,6 +659,71 @@ class ThermodynamicsCalculator:
             results['error'] = error_msg
         
         return results
+
+    def calculate_brayton_cycle(self, fluid_name, p1_pa, t1_k, pressure_ratio, t3_k, eta_comp, eta_turb, mdot=1.0):
+        """Calculate a simple simple-open Brayton cycle (idealized):
+        States:
+        1: compressor inlet (P1,T1)
+        2: compressor outlet (P2=P1*PR, actual via isentropic efficiency)
+        3: combustor exit (P3 ~= P2, T3 given)
+        4: turbine exit (P4 ~= P1)
+        Returns dict with 'states' and 'metrics' and optional 'error'.
+        All energies per unit mass (J/kg).
+        """
+        res = {'states': {}, 'metrics': {}, 'error': None}
+        try:
+            # basic validation
+            if pressure_ratio <= 1.0: raise ValueError('Pressure ratio must be > 1')
+            if not (0.0 < eta_comp <= 1.0) or not (0.0 < eta_turb <= 1.0): raise ValueError('Efficiencies must be between 0 and 1')
+            # State 1
+            p1 = float(p1_pa); t1 = float(t1_k)
+            h1 = CP.PropsSI('H', 'T', t1, 'P', p1, fluid_name)
+            s1 = CP.PropsSI('S', 'T', t1, 'P', p1, fluid_name)
+            res['states'][1] = {'P': p1, 'T': t1, 'H': h1, 'S': s1}
+
+            # Compressor to P2
+            p2 = p1 * float(pressure_ratio)
+            # isentropic compressor outlet
+            try:
+                h2s = CP.PropsSI('H', 'P', p2, 'S', s1, fluid_name)
+            except Exception:
+                # fallback: ideal gas approximation for temp rise using isentropic relation could be used, but raise
+                raise
+            # actual
+            h2 = h1 + (h2s - h1) / float(eta_comp)
+            t2 = CP.PropsSI('T', 'P', p2, 'H', h2, fluid_name)
+            s2 = CP.PropsSI('S', 'P', p2, 'H', h2, fluid_name)
+            res['states'][2] = {'P': p2, 'T': t2, 'H': h2, 'S': s2}
+
+            # Combustor: heat at constant pressure p2 to T3
+            t3 = float(t3_k)
+            h3 = CP.PropsSI('H', 'T', t3, 'P', p2, fluid_name)
+            s3 = CP.PropsSI('S', 'T', t3, 'P', p2, fluid_name)
+            res['states'][3] = {'P': p2, 'T': t3, 'H': h3, 'S': s3}
+
+            # Turbine expands to p4 = p1
+            p4 = p1
+            try:
+                h4s = CP.PropsSI('H', 'P', p4, 'S', s3, fluid_name)
+            except Exception:
+                raise
+            h4 = h3 - float(eta_turb) * (h3 - h4s)
+            t4 = CP.PropsSI('T', 'P', p4, 'H', h4, fluid_name)
+            s4 = CP.PropsSI('S', 'P', p4, 'H', h4, fluid_name)
+            res['states'][4] = {'P': p4, 'T': t4, 'H': h4, 'S': s4}
+
+            # Performance metrics per unit mass
+            w_comp = h2 - h1
+            w_turb = h3 - h4
+            w_net = w_turb - w_comp
+            q_in = h3 - h2
+            eta_thermal = w_net / q_in if q_in > 0 else float('nan')
+            res['metrics'] = {'W_comp': w_comp, 'W_turb': w_turb, 'W_net': w_net, 'Q_in': q_in, 'eta': eta_thermal, 'mdot': mdot}
+        except ValueError as ve:
+            res['error'] = f'Brayton Calc Error: {ve}'
+        except Exception as e:
+            logging.error(f'Unexpected Brayton error: {e}', exc_info=True); res['error'] = f'Unexpected Brayton error: {e}'
+        return res
     # --- NEW: Psychrometric (Humid Air) Calculation ---
     def calculate_humid_air_properties(self, t_db_k, rh_frac, p_pa):
         """
@@ -642,6 +778,81 @@ class ThermodynamicsCalculator:
             results['error'] = error_msg
             
         return results
+
+    def calculate_mixed_air(self, mdot1, t1_k, rh1, mdot2, t2_k, rh2, p_pa):
+        """Mix two moist air streams.
+        mdot1, mdot2: mass flow of moist air [kg/s]
+        t1_k, t2_k: dry-bulb temps [K]
+        rh1, rh2: relative humidity fractions [0-1]
+        p_pa: pressure [Pa]
+        Returns dict with 'mixed' properties (T, RH, W, H) and original stream props.
+        """
+        out = {'mixed': None, 'streams': {}, 'error': None}
+        try:
+            # compute properties for each stream: W (kg/kg dry air) and H (J/kg dry air)
+            W1 = CP.HAPropsSI('W', 'T', t1_k, 'R', rh1, 'P', p_pa)
+            H1 = CP.HAPropsSI('H', 'T', t1_k, 'R', rh1, 'P', p_pa)
+            W2 = CP.HAPropsSI('W', 'T', t2_k, 'R', rh2, 'P', p_pa)
+            H2 = CP.HAPropsSI('H', 'T', t2_k, 'R', rh2, 'P', p_pa)
+
+            # convert moist-air mass flow to dry-air mass flow (md_da = md_total / (1+W))
+            md_da1 = float(mdot1) / (1.0 + W1) if mdot1 is not None else 0.0
+            md_da2 = float(mdot2) / (1.0 + W2) if mdot2 is not None else 0.0
+            if md_da1 + md_da2 <= 0:
+                raise ValueError('Total dry-air mass flow must be positive')
+
+            # mixture humidity ratio and enthalpy per kg dry air (mass-weighted by dry-air flow)
+            W_mix = (md_da1 * W1 + md_da2 * W2) / (md_da1 + md_da2)
+            H_mix = (md_da1 * H1 + md_da2 * H2) / (md_da1 + md_da2)
+
+            # find mixed dry-bulb temperature from H_mix, W_mix and pressure using HAPropsSI
+            try:
+                T_mix = CP.HAPropsSI('T', 'H', H_mix, 'P', p_pa, 'W', W_mix)
+                # get RH from T and W
+                RH_mix = CP.HAPropsSI('R', 'T', T_mix, 'P', p_pa, 'W', W_mix)
+            except Exception:
+                # fallback: approximate T by energy balance using specific heat (not implemented)
+                raise
+
+            out['streams'][1] = {'mdot': mdot1, 'T': t1_k, 'RH': rh1, 'W': W1, 'H': H1}
+            out['streams'][2] = {'mdot': mdot2, 'T': t2_k, 'RH': rh2, 'W': W2, 'H': H2}
+            out['mixed'] = {'T': T_mix, 'RH': RH_mix, 'W': W_mix, 'H': H_mix}
+        except Exception as e:
+            logging.error(f'Mixing error: {e}', exc_info=True); out['error'] = f'Mixing error: {e}'
+        return out
+
+    def psychrometric_chart_data(self, p_pa, t_min_c=0.0, t_max_c=50.0, N=161, rh_values=None):
+        """Return psychrometric chart lines (T [degC] vs W [kg/kg]) for given RH values.
+        rh_values: iterable of RH fractions (0-1). If None, use 0.1..1.0.
+        Returns dict {'rh_lines': {rh: (TdegC_array, W_array)}, 'saturation': (TdegC, Wsat)}
+        """
+        if rh_values is None:
+            rh_values = [i/10.0 for i in range(1, 11)]
+        data = {'rh_lines': {}, 'saturation': None, 'error': None}
+        try:
+            T_c = np.linspace(t_min_c, t_max_c, N)
+            T_k = (self.Q_(T_c, 'degC').to('K').m)
+            # saturation (RH=1)
+            W_sat = []
+            for tk in T_k:
+                try:
+                    w = CP.HAPropsSI('W', 'T', tk, 'R', 1.0, 'P', p_pa)
+                except Exception:
+                    w = np.nan
+                W_sat.append(w)
+            data['saturation'] = (T_c, np.array(W_sat))
+            for rh in rh_values:
+                W_line = []
+                for tk in T_k:
+                    try:
+                        w = CP.HAPropsSI('W', 'T', tk, 'R', rh, 'P', p_pa)
+                    except Exception:
+                        w = np.nan
+                    W_line.append(w)
+                data['rh_lines'][rh] = (T_c, np.array(W_line))
+        except Exception as e:
+            logging.error(f'Psychro chart error: {e}', exc_info=True); data['error'] = f'Psychro chart error: {e}'
+        return data
 
 # --- ToolTip Class ---
 class ToolTip:
@@ -703,11 +914,89 @@ class CoolPropApp(tk.Tk):
             except: pass
         style.map("Treeview", background=[('selected', '#0078D7')], foreground=[('selected', 'white')]); style.configure("Treeview", rowheight=20); style.configure("Treeview.Heading", font=('TkDefaultFont', 9, 'bold')); style.configure("Error.Treeview", foreground='red'); style.map("Error.Treeview", foreground=[('!selected', 'red'), ('selected', 'white')], background=[('selected', '#0078D7')])
 
+    def _set_busy(self):
+        try:
+            self.config(cursor='watch')
+            self.update_idletasks()
+        except Exception:
+            pass
+
+    def _clear_busy(self):
+        try:
+            self.config(cursor='')
+            self.update_idletasks()
+        except Exception:
+            pass
+
+    def _run_task_async(self, func, args=(), kwargs=None, on_done=None, title="Working..."):
+        """Run func(*args, **(kwargs or {})) in a background thread and show a modal progress window.
+        on_done(result, exception) will be called in the main thread when finished.
+        """
+        if kwargs is None: kwargs = {}
+        # Disable main notebook to avoid conflicting actions
+        try:
+            self.notebook.config(state='disabled')
+        except Exception:
+            pass
+
+        modal = tk.Toplevel(self)
+        modal.transient(self); modal.grab_set(); modal.title(title)
+        modal.resizable(False, False)
+        ttk.Label(modal, text=title).grid(row=0, column=0, padx=12, pady=(8,4))
+        pb = ttk.Progressbar(modal, mode='indeterminate', length=300)
+        pb.grid(row=1, column=0, padx=12, pady=(0,8))
+        pb.start(50)
+
+        cancel_flag = {'cancelled': False}
+        def _on_cancel():
+            cancel_flag['cancelled'] = True
+            try: modal.title(title + ' (cancelling...)')
+            except: pass
+
+        btn = ttk.Button(modal, text='Cancel', command=_on_cancel)
+        btn.grid(row=2, column=0, padx=12, pady=(0,8))
+
+        result_container = {'result': None, 'exception': None}
+
+        def _worker():
+            try:
+                res = func(*args, **kwargs)
+                result_container['result'] = res
+            except Exception as e:
+                result_container['exception'] = e
+            # schedule completion on main thread
+            def _finish():
+                try:
+                    pb.stop()
+                except Exception:
+                    pass
+                try:
+                    modal.grab_release(); modal.destroy()
+                except Exception:
+                    pass
+                try:
+                    self.notebook.config(state='normal')
+                except Exception:
+                    pass
+                if on_done:
+                    try:
+                        on_done(result_container.get('result'), result_container.get('exception'))
+                    except Exception as e:
+                        logging.error(f"Error in on_done callback: {e}", exc_info=True)
+            try:
+                self.after(50, _finish)
+            except Exception:
+                _finish()
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+
     def _setup_variables(self):
         self.fluid_var = tk.StringVar(value="Water"); self.fluid_filter_var = tk.StringVar()
         # Mixture builder state: list of (component, fraction)
         self.mixture_components = []
         self.mixture_fraction_var = tk.StringVar(value="50")
+        self.mixture_sum_var = tk.StringVar(value="Sum: 0.000")
         # Plot options
         self.show_isotherms_var = tk.BooleanVar(value=False); self.show_isobars_var = tk.BooleanVar(value=False)
         self.show_quality_lines_var = tk.BooleanVar(value=False)
@@ -733,6 +1022,14 @@ class CoolPropApp(tk.Tk):
         self.psychro_tdb_var = tk.StringVar(value="25") # degC
         self.psychro_rh_var = tk.StringVar(value="50") # %
         self.psychro_p_var = tk.StringVar(value="101.325") # kPa
+        # Psychro chart settings and mix history
+        self.psychro_chart_tmin_var = tk.StringVar(value='-10')
+        self.psychro_chart_tmax_var = tk.StringVar(value='50')
+        self.mix_history = []
+        self.mix_history_limit = 10
+        # Psychro chart overlay toggles
+        self.psychro_show_enthalpy_var = tk.BooleanVar(value=True)
+        self.psychro_show_wetbulb_var = tk.BooleanVar(value=True)
 
     def _create_menu(self):
         self.menu_bar=tk.Menu(self); self.config(menu=self.menu_bar); f=tk.Menu(self.menu_bar, tearoff=0); self.menu_bar.add_cascade(label="File", menu=f); f.add_command(label="Exit", command=self._on_closing)
@@ -758,6 +1055,9 @@ class CoolPropApp(tk.Tk):
         # --- NEW P-T Saturation Tab Setup ---
         self.psat_plot_tab = ttk.Frame(self.notebook, padding="5")
         self.notebook.add(self.psat_plot_tab, text=PSAT_TAB_TEXT)
+        # Brayton Cycle tab
+        self.brayton_tab = ttk.Frame(self.notebook, padding="5")
+        self.notebook.add(self.brayton_tab, text=" Brayton Cycle ")
         # Converter tab
         self.converter_tab = ttk.Frame(self.notebook, padding="5")
         self.notebook.add(self.converter_tab, text=" Convertisseur ")
@@ -776,8 +1076,43 @@ class CoolPropApp(tk.Tk):
         self._create_refrig_widgets(self.refrig_tab)
         self._create_psychro_widgets(self.psychro_tab)
         self._create_psat_plot_widgets(self.psat_plot_tab) # NEW Call
+        self._create_brayton_widgets(self.brayton_tab)
         self._create_converter_widgets(self.converter_tab)
         self._setup_plot_layout()
+
+    def _create_brayton_widgets(self, parent_frame):
+        left = ttk.Frame(parent_frame); left.grid(row=0, column=0, sticky='nsew', padx=(5,5)); left.grid_columnconfigure(1, weight=1)
+        inputs = ttk.LabelFrame(left, text='Brayton Inputs', padding=8); inputs.grid(row=0, column=0, sticky='new', pady=(0,6))
+        ttk.Label(inputs, text='Inlet T (°C):').grid(row=0, column=0, padx=5, pady=3, sticky='w')
+        self.brayton_t1_var = tk.StringVar(value='15'); ttk.Entry(inputs, textvariable=self.brayton_t1_var, width=10).grid(row=0, column=1, padx=5, pady=3, sticky='w')
+        ttk.Label(inputs, text='Inlet P (kPa):').grid(row=1, column=0, padx=5, pady=3, sticky='w')
+        self.brayton_p1_var = tk.StringVar(value='101.325'); ttk.Entry(inputs, textvariable=self.brayton_p1_var, width=10).grid(row=1, column=1, padx=5, pady=3, sticky='w')
+        ttk.Label(inputs, text='Pressure ratio:').grid(row=2, column=0, padx=5, pady=3, sticky='w')
+        self.brayton_pr_var = tk.StringVar(value='10'); ttk.Entry(inputs, textvariable=self.brayton_pr_var, width=10).grid(row=2, column=1, padx=5, pady=3, sticky='w')
+        ttk.Label(inputs, text='Max T (combustor) (°C):').grid(row=3, column=0, padx=5, pady=3, sticky='w')
+        self.brayton_t3_var = tk.StringVar(value='1400'); ttk.Entry(inputs, textvariable=self.brayton_t3_var, width=10).grid(row=3, column=1, padx=5, pady=3, sticky='w')
+        ttk.Label(inputs, text='Compressor η (%):').grid(row=4, column=0, padx=5, pady=3, sticky='w')
+        self.brayton_eta_comp_var = tk.StringVar(value='85'); ttk.Entry(inputs, textvariable=self.brayton_eta_comp_var, width=10).grid(row=4, column=1, padx=5, pady=3, sticky='w')
+        ttk.Label(inputs, text='Turbine η (%):').grid(row=5, column=0, padx=5, pady=3, sticky='w')
+        self.brayton_eta_turb_var = tk.StringVar(value='88'); ttk.Entry(inputs, textvariable=self.brayton_eta_turb_var, width=10).grid(row=5, column=1, padx=5, pady=3, sticky='w')
+        ttk.Label(inputs, text='Mass flow (kg/s) [opt]:').grid(row=6, column=0, padx=5, pady=3, sticky='w')
+        self.brayton_mdot_var = tk.StringVar(value='1.0'); ttk.Entry(inputs, textvariable=self.brayton_mdot_var, width=10).grid(row=6, column=1, padx=5, pady=3, sticky='w')
+        calc_btn = ttk.Button(inputs, text='Calculate Brayton', command=self._calculate_brayton_orchestrator)
+        calc_btn.grid(row=7, column=0, columnspan=2, pady=8)
+
+        right = ttk.Frame(parent_frame); right.grid(row=0, column=1, sticky='nsew', padx=(5,0)); right.grid_rowconfigure(1, weight=1); right.grid_columnconfigure(0, weight=1)
+        res_frame = ttk.LabelFrame(right, text='Brayton States', padding=8); res_frame.grid(row=0, column=0, sticky='nsew')
+        cols = ('point','T','P','H','S')
+        self.brayton_tree = ttk.Treeview(res_frame, columns=cols, show='headings', height=8)
+        for c in cols: self.brayton_tree.heading(c, text=c)
+        self.brayton_tree.column('point', width=60, anchor=tk.CENTER); self.brayton_tree.column('T', width=80, anchor=tk.E); self.brayton_tree.column('P', width=80, anchor=tk.E); self.brayton_tree.column('H', width=100, anchor=tk.E); self.brayton_tree.column('S', width=100, anchor=tk.E)
+        self.brayton_tree.grid(row=0, column=0, sticky='nsew')
+        btns = ttk.Frame(res_frame); btns.grid(row=1, column=0, sticky='ew', pady=(6,0)); export_btn = ttk.Button(btns, text='Export CSV', command=lambda: self._export_treeview_to_csv(self.brayton_tree, 'brayton_cycle.csv', extra_info=(self.current_fluid_for_plot if getattr(self, 'current_fluid_for_plot', None) else self.fluid_var.get())))
+        export_btn.pack(side=tk.LEFT, padx=6)
+
+        # small note
+        note = ttk.Label(right, text='Plot displayed on T-s diagram (select Brayton tab and open T-s).')
+        note.grid(row=2, column=0, sticky='w', pady=(6,0))
 
     def _create_calculator_widgets(self, parent_frame):
         left_frame = ttk.Frame(parent_frame); left_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5)); left_frame.grid_rowconfigure(2, weight=1); left_frame.grid_columnconfigure(0, weight=1)
@@ -802,6 +1137,15 @@ class CoolPropApp(tk.Tk):
         self.mixture_tree.heading('comp', text='Component'); self.mixture_tree.heading('frac', text='Frac (%)')
         self.mixture_tree.column('comp', width=140, anchor=tk.W); self.mixture_tree.column('frac', width=60, anchor=tk.E)
         self.mixture_tree.grid(row=1, column=0, columnspan=5, sticky='nsew', pady=(4,0))
+        # Row with edit controls for mixture tree
+        mix_btn_frame = ttk.Frame(mixture_frame)
+        mix_btn_frame.grid(row=2, column=0, columnspan=5, sticky='ew', pady=(6,0))
+        remove_btn = ttk.Button(mix_btn_frame, text='Remove Selected', command=self._remove_selected_mixture_component, width=16)
+        edit_btn = ttk.Button(mix_btn_frame, text='Edit Selected', command=self._edit_selected_mixture_component, width=12)
+        norm_btn = ttk.Button(mix_btn_frame, text='Normalize Fractions', command=self._normalize_mixture_fractions, width=16)
+        remove_btn.pack(side=tk.LEFT, padx=(2,6)); edit_btn.pack(side=tk.LEFT, padx=(2,6)); norm_btn.pack(side=tk.LEFT, padx=(2,6))
+        self.mixture_sum_label = ttk.Label(mix_btn_frame, textvariable=self.mixture_sum_var, anchor='e')
+        self.mixture_sum_label.pack(side=tk.RIGHT, padx=(2,6))
         mixture_frame.grid_columnconfigure(1, weight=0); mixture_frame.grid_columnconfigure(2, weight=0); mixture_frame.grid_columnconfigure(3, weight=0); mixture_frame.grid_columnconfigure(4, weight=0)
         # --- Custom Fluid String ---
         ttk.Label(fluid_frame, text="Custom Fluid string:").grid(row=3, column=0, padx=5, pady=(8,2), sticky='w')
@@ -1083,6 +1427,28 @@ class CoolPropApp(tk.Tk):
                 if config.has_option('RankineInputs', 'TBoiler'): self.rankine_t_boiler_var.set(config.get('RankineInputs', 'TBoiler'))
                 if config.has_option('RankineInputs', 'PCondenser'): self.rankine_p_cond_var.set(config.get('RankineInputs', 'PCondenser'))
                 if config.has_option('RankineInputs', 'EtaTurbine'): self.rankine_eta_turbine_var.set(config.get('RankineInputs', 'EtaTurbine'))
+            # Psychrometric settings
+            if config.has_section('Psychro'):
+                if config.has_option('Psychro', 'LastChartPressure'): self.psychro_p_var.set(config.get('Psychro', 'LastChartPressure'))
+                if config.has_option('Psychro', 'ChartTmin'): self.psychro_chart_tmin_var.set(config.get('Psychro', 'ChartTmin'))
+                if config.has_option('Psychro', 'ChartTmax'): self.psychro_chart_tmax_var.set(config.get('Psychro', 'ChartTmax'))
+                if config.has_option('Psychro', 'ShowEnthalpy'):
+                    try: self.psychro_show_enthalpy_var.set(config.getboolean('Psychro', 'ShowEnthalpy'))
+                    except Exception: pass
+                if config.has_option('Psychro', 'ShowWetBulb'):
+                    try: self.psychro_show_wetbulb_var.set(config.getboolean('Psychro', 'ShowWetBulb'))
+                    except Exception: pass
+                if config.has_option('Psychro', 'MixHistory'):
+                    try:
+                        hist_json = config.get('Psychro', 'MixHistory')
+                        loaded = json.loads(hist_json)
+                        if isinstance(loaded, list):
+                            self.mix_history = loaded[:self.mix_history_limit];
+                    except Exception as e:
+                        logging.warning(f'Could not load psychro mix history: {e}')
+            # update mix history UI if present
+            try: self._update_mix_history_display()
+            except: pass
         except Exception as e: logging.error(f"Error loading settings: {e}", exc_info=True); messagebox.showwarning("Load Settings Error", f"Could not load settings.\nUsing defaults.\n\nError: {e}", parent=self); self._setup_variables(); self._initial_state_setup()
 
     def _save_settings(self):
@@ -1094,6 +1460,20 @@ class CoolPropApp(tk.Tk):
             config['Outputs'] = {}; selected_indices = self.output_listbox.curselection(); selected_names = [self.output_listbox.get(i) for i in selected_indices]; config['Outputs']['Selected'] = ','.join(selected_names)
             config['PlotOptions'] = {}; config['PlotOptions']['ShowIsotherms'] = str(self.show_isotherms_var.get()); config['PlotOptions']['ShowIsobars'] = str(self.show_isobars_var.get())
             config['RankineInputs'] = {}; config['RankineInputs']['PBoiler'] = self.rankine_p_boiler_var.get(); config['RankineInputs']['TBoiler'] = self.rankine_t_boiler_var.get(); config['RankineInputs']['PCondenser'] = self.rankine_p_cond_var.get(); config['RankineInputs']['EtaTurbine'] = self.rankine_eta_turbine_var.get()
+            # Psychrometric settings
+            config['Psychro'] = {}
+            config['Psychro']['LastChartPressure'] = self.psychro_p_var.get()
+            config['Psychro']['ChartTmin'] = self.psychro_chart_tmin_var.get()
+            config['Psychro']['ChartTmax'] = self.psychro_chart_tmax_var.get()
+            try:
+                config['Psychro']['ShowEnthalpy'] = str(self.psychro_show_enthalpy_var.get())
+                config['Psychro']['ShowWetBulb'] = str(self.psychro_show_wetbulb_var.get())
+            except Exception:
+                pass
+            try:
+                config['Psychro']['MixHistory'] = json.dumps(self.mix_history)
+            except Exception:
+                config['Psychro']['MixHistory'] = '[]'
             with open(CONFIG_FILE, 'w') as configfile: config.write(configfile)
             logging.info("Settings saved successfully.")
         except Exception as e: logging.error(f"Error saving settings: {e}", exc_info=True); messagebox.showerror("Save Settings Error", f"Could not save settings:\n{e}", parent=self)
@@ -1142,8 +1522,59 @@ class CoolPropApp(tk.Tk):
             for it in self.mixture_tree.get_children(): self.mixture_tree.delete(it)
             for comp, frac in self.mixture_components:
                 self.mixture_tree.insert('', tk.END, values=(comp, f"{frac:.3f}"))
+            # update sum display
+            try:
+                total = sum(f for _, f in self.mixture_components)
+                self.mixture_sum_var.set(f"Sum: {total:.3f}")
+            except Exception:
+                self.mixture_sum_var.set("Sum: ?")
         except Exception as e:
             logging.error(f"Could not update mixture display: {e}", exc_info=True)
+
+    def _remove_selected_mixture_component(self):
+        try:
+            sel = self.mixture_tree.selection()
+            if not sel: return
+            iid = sel[0]
+            vals = self.mixture_tree.item(iid).get('values', [])
+            if not vals: return
+            comp = vals[0]
+            # remove first matching component entry
+            for i, (c, f) in enumerate(self.mixture_components):
+                if c == comp:
+                    del self.mixture_components[i]; break
+            self._update_mixture_display()
+        except Exception as e:
+            logging.error(f"Could not remove mixture component: {e}", exc_info=True)
+
+    def _edit_selected_mixture_component(self):
+        try:
+            sel = self.mixture_tree.selection()
+            if not sel: return
+            iid = sel[0]
+            vals = self.mixture_tree.item(iid).get('values', [])
+            if not vals: return
+            comp, frac_str = vals[0], vals[1]
+            new_frac = simpledialog.askstring('Edit Fraction', f'Enter new fraction (percent) for {comp}:', initialvalue=str(frac_str), parent=self)
+            if new_frac is None: return
+            new_frac = float(new_frac)
+            for i, (c, f) in enumerate(self.mixture_components):
+                if c == comp:
+                    self.mixture_components[i] = (c, float(new_frac)); break
+            self._update_mixture_display()
+        except Exception as e:
+            logging.error(f"Could not edit mixture component: {e}", exc_info=True)
+
+    def _normalize_mixture_fractions(self):
+        try:
+            if not self.mixture_components: return
+            total = sum(f for _, f in self.mixture_components)
+            if total <= 0: return
+            factor = 100.0 / total
+            self.mixture_components = [(c, f * factor) for c, f in self.mixture_components]
+            self._update_mixture_display()
+        except Exception as e:
+            logging.error(f"Could not normalize mixture fractions: {e}", exc_info=True)
 
     def _build_mixture_string(self):
         """Builds a CoolProp HEOS mixture string from self.mixture_components.
@@ -1170,6 +1601,9 @@ class CoolPropApp(tk.Tk):
             messagebox.showerror("Mixture Error", f"Could not build mixture: {e}", parent=self); return
         # Apply mixture string as current fluid
         self.fluid_var.set(mix)
+        # invalidate calculator cache when fluid changes
+        try: self.calculator.clear_cache(mix)
+        except: self.calculator.clear_cache()
         # Update fluid info and plots
         try:
             self._update_fluid_info()
@@ -1184,6 +1618,8 @@ class CoolPropApp(tk.Tk):
         try:
             for it in self.mixture_tree.get_children(): self.mixture_tree.delete(it)
         except: pass
+        try: self.calculator.clear_cache()
+        except: pass
 
     def _apply_custom_fluid(self):
         s = self.custom_fluid_var.get().strip()
@@ -1196,6 +1632,8 @@ class CoolPropApp(tk.Tk):
             if not messagebox.askyesno('Custom Fluid', 'String does not look like a CoolProp fluid string. Apply anyway?', parent=self):
                 return
         self.fluid_var.set(s)
+        try: self.calculator.clear_cache(s)
+        except: self.calculator.clear_cache()
         try:
             self._update_fluid_info()
         except Exception:
@@ -1215,6 +1653,8 @@ class CoolPropApp(tk.Tk):
                 self.fluid_var.set(self.fluid_listbox.get(sel)); self._update_fluid_info(); self._update_psat_plot(self.fluid_var.get())
         except Exception:
             pass
+            try: self.calculator.clear_cache()
+            except: pass
 
     def _get_prop_code_from_display(self, d): return self.display_to_code_map.get(d, 'DEFAULT')
     def _get_prop_details(self, c): return PROPERTY_INFO.get(c.upper(), PROPERTY_INFO['DEFAULT'])
@@ -1392,21 +1832,95 @@ class CoolPropApp(tk.Tk):
             
             # Draw quality lines inside dome if requested
             if self.show_quality_lines_var.get():
-                try:
-                    qdata = self.calculator.calculate_quality_curves_ph(fluid_name)
-                    if not qdata.get('error'):
+                # Calculate quality curves asynchronously
+                def _on_qdone_ph(result, exc):
+                    # remove previous quality lines
+                    try:
+                        for item in [i for i in (self.ph_ax.lines + self.ph_ax.collections) if getattr(i,'get_label',lambda:None)() and getattr(i,'get_label')().startswith('quality_ph_')]:
+                            try: item.remove()
+                            except: pass
+                    except Exception:
+                        pass
+                    if exc:
+                        logging.error(f"Quality PH generation failed: {exc}", exc_info=True); return
+                    qdata = result
+                    if not qdata or qdata.get('error'): return
+                    try:
                         for x_val, dat in qdata.get('x_lines', {}).items():
-                            try: self.ph_ax.plot(dat['h'], dat['p'], color='grey', ls=':', lw=0.7, alpha=0.8, zorder=3)
-                            except: continue
+                            try:
+                                ln, = self.ph_ax.plot(dat['h'], dat['p'], color='grey', ls=':', lw=0.7, alpha=0.8, zorder=3)
+                                try: ln.set_label(f'quality_ph_{x_val}')
+                                except: pass
+                            except Exception:
+                                continue
+                        try: self.ph_canvas.draw_idle()
+                        except: pass
+                    except Exception:
+                        logging.exception('Failed plotting quality lines (P-h)')
+
+                try:
+                    self._run_task_async(self.calculator.calculate_quality_curves_ph, args=(fluid_name,), on_done=_on_qdone_ph, title=f'Quality lines P-h ({fluid_name})')
                 except Exception:
-                    pass
+                    try:
+                        qdata = self.calculator.calculate_quality_curves_ph(fluid_name)
+                        if qdata and not qdata.get('error'):
+                            for x_val, dat in qdata.get('x_lines', {}).items():
+                                try: self.ph_ax.plot(dat['h'], dat['p'], color='grey', ls=':', lw=0.7, alpha=0.8, zorder=3)
+                                except: continue
+                    except Exception:
+                        pass
 
             if self.show_isotherms_var.get() and self.last_si_results:
                 t_si = self.last_si_results.get('values', {}).get('T')
                 if isinstance(t_si, (int, float)):
-                    iso = self.calculator.calculate_ph_isotherm(fluid_name, t_si)
-                    if not iso.get('error'): self.ph_ax.plot(iso['h'], iso['p'], 'g--', lw=0.8, label=f'T={self.Q_(t_si,"K").to("degC").m:.0f}C', zorder=3); self.ph_ax.legend(loc='best', fontsize='small')
+                    def _on_iso_done(iso, exc):
+                        # remove previous isotherm lines
+                        try:
+                            for item in [i for i in (self.ph_ax.lines + self.ph_ax.collections) if getattr(i,'get_label',lambda:None)() and getattr(i,'get_label')().startswith('isotherm_ph_')]:
+                                try: item.remove()
+                                except: pass
+                        except Exception:
+                            pass
+                        if exc:
+                            logging.error(f"PH isotherm generation failed: {exc}", exc_info=True); return
+                        try:
+                            if iso and not iso.get('error'):
+                                ln, = self.ph_ax.plot(iso['h'], iso['p'], 'g--', lw=0.8, zorder=3)
+                                try: ln.set_label(f'isotherm_ph_{int(round(t_si))}')
+                                except: pass
+                                try: self.ph_ax.legend(loc='best', fontsize='small')
+                                except: pass
+                                try: self.ph_canvas.draw_idle()
+                                except: pass
+                        except Exception:
+                            logging.exception('Failed plotting P-h isotherm')
+
+                    try:
+                        self._run_task_async(self.calculator.calculate_ph_isotherm, args=(fluid_name, t_si), on_done=_on_iso_done, title=f'P-h Isotherm @ {self.Q_(t_si,"K").to("degC").m:.0f}C')
+                    except Exception:
+                        try:
+                            iso = self.calculator.calculate_ph_isotherm(fluid_name, t_si)
+                            if not iso.get('error'):
+                                self.ph_ax.plot(iso['h'], iso['p'], 'g--', lw=0.8, label=f'T={self.Q_(t_si,"K").to("degC").m:.0f}C', zorder=3); self.ph_ax.legend(loc='best', fontsize='small')
+                        except Exception:
+                            pass
             self.ph_fig.tight_layout()
+            # Annotate with fluid/mix info (small label)
+            try:
+                # remove previous mixture label if present
+                for t in list(self.ph_ax.texts):
+                    try:
+                        if getattr(t, 'get_gid', lambda: None)() == 'mixture_label': t.remove()
+                    except Exception:
+                        try: t.remove()
+                        except Exception: pass
+                disp = self._short_fluid_display(fluid_name)
+                if disp:
+                    txt = self.ph_ax.text(0.98, 0.02, disp, transform=self.ph_ax.transAxes, ha='right', va='bottom', fontsize='8', bbox=dict(fc='white', alpha=0.7, pad=2))
+                    try: txt.set_gid('mixture_label')
+                    except: pass
+            except Exception:
+                pass
         except Exception: pass
 
     def _plot_ts_base(self, fluid_name, dome_data):
@@ -1423,32 +1937,114 @@ class CoolPropApp(tk.Tk):
 
             # Draw quality lines inside dome if requested
             if self.show_quality_lines_var.get():
-                try:
-                    qdata = self.calculator.calculate_quality_curves_ts(fluid_name)
-                    if not qdata.get('error'):
+                # async quality lines for T-s
+                def _on_qdone_ts(result, exc):
+                    try:
+                        for item in [i for i in (self.ts_ax.lines + self.ts_ax.collections) if getattr(i,'get_label',lambda:None)() and getattr(i,'get_label')().startswith('quality_ts_')]:
+                            try: item.remove()
+                            except: pass
+                    except Exception:
+                        pass
+                    if exc:
+                        logging.error(f"Quality TS generation failed: {exc}", exc_info=True); return
+                    qdata = result
+                    if not qdata or qdata.get('error'): return
+                    try:
                         for x_val, dat in qdata.get('x_lines', {}).items():
-                            try: self.ts_ax.plot(dat['s'], dat['t'], color='grey', ls=':', lw=0.7, alpha=0.8, zorder=3)
-                            except: continue
+                            try:
+                                ln, = self.ts_ax.plot(dat['s'], dat['t'], color='grey', ls=':', lw=0.7, alpha=0.8, zorder=3)
+                                try: ln.set_label(f'quality_ts_{x_val}')
+                                except: pass
+                            except Exception:
+                                continue
+                        try: self.ts_canvas.draw_idle()
+                        except: pass
+                    except Exception:
+                        logging.exception('Failed plotting quality lines (T-s)')
+
+                try:
+                    self._run_task_async(self.calculator.calculate_quality_curves_ts, args=(fluid_name,), on_done=_on_qdone_ts, title=f'Quality lines T-s ({fluid_name})')
                 except Exception:
-                    pass
+                    try:
+                        qdata = self.calculator.calculate_quality_curves_ts(fluid_name)
+                        if qdata and not qdata.get('error'):
+                            for x_val, dat in qdata.get('x_lines', {}).items():
+                                try: self.ts_ax.plot(dat['s'], dat['t'], color='grey', ls=':', lw=0.7, alpha=0.8, zorder=3)
+                                except: continue
+                    except Exception:
+                        pass
 
             if self.show_isobars_var.get() and self.last_si_results:
                 p_si = self.last_si_results.get('values', {}).get('P')
                 if isinstance(p_si, (int, float)):
-                    iso = self.calculator.calculate_ts_isobar(fluid_name, p_si)
-                    if not iso.get('error'): self.ts_ax.plot(iso['s'], iso['t'], 'm--', lw=0.8, label=f'P={self.Q_(p_si,"Pa").to("bar").m:.2f}bar', zorder=3); self.ts_ax.legend(loc='best', fontsize='small')
+                    def _on_isobar_done(iso, exc):
+                        try:
+                            for item in [i for i in (self.ts_ax.lines + self.ts_ax.collections) if getattr(i,'get_label',lambda:None)() and getattr(i,'get_label')().startswith('isobar_ts_')]:
+                                try: item.remove()
+                                except: pass
+                        except Exception:
+                            pass
+                        if exc:
+                            logging.error(f"TS isobar generation failed: {exc}", exc_info=True); return
+                        try:
+                            if iso and not iso.get('error'):
+                                ln, = self.ts_ax.plot(iso['s'], iso['t'], 'm--', lw=0.8, zorder=3)
+                                try: ln.set_label(f'isobar_ts_{int(round(p_si/1000.0))}')
+                                except: pass
+                                try: self.ts_ax.legend(loc='best', fontsize='small')
+                                except: pass
+                                try: self.ts_canvas.draw_idle()
+                                except: pass
+                        except Exception:
+                            logging.exception('Failed plotting T-s isobar')
+
+                    try:
+                        self._run_task_async(self.calculator.calculate_ts_isobar, args=(fluid_name, p_si), on_done=_on_isobar_done, title=f'T-s Isobar @ {self.Q_(p_si,"Pa").to("kPa").m:.1f} kPa')
+                    except Exception:
+                        try:
+                            iso = self.calculator.calculate_ts_isobar(fluid_name, p_si)
+                            if not iso.get('error'): self.ts_ax.plot(iso['s'], iso['t'], 'm--', lw=0.8, label=f'P={self.Q_(p_si,"Pa").to("bar").m:.2f}bar', zorder=3); self.ts_ax.legend(loc='best', fontsize='small')
+                        except Exception:
+                            pass
             self.ts_fig.tight_layout()
+            # Annotate with fluid/mix info (small label)
+            try:
+                for t in list(self.ts_ax.texts):
+                    try:
+                        if getattr(t, 'get_gid', lambda: None)() == 'mixture_label': t.remove()
+                    except Exception:
+                        try: t.remove()
+                        except Exception: pass
+                disp = self._short_fluid_display(fluid_name)
+                if disp:
+                    txt = self.ts_ax.text(0.98, 0.02, disp, transform=self.ts_ax.transAxes, ha='right', va='bottom', fontsize='8', bbox=dict(fc='white', alpha=0.7, pad=2))
+                    try: txt.set_gid('mixture_label')
+                    except: pass
+            except Exception:
+                pass
         except Exception:
             pass
 
     # --- Export CSV helpers ---
-    def _export_treeview_to_csv(self, tree, default_name="export.csv"):
+    def _export_treeview_to_csv(self, tree, default_name="export.csv", extra_info=None):
+        """Export a Treeview to CSV. If extra_info is provided, write it as the first row.
+        extra_info can be a string or dict (will be serialized simply).
+        """
         try:
             filename = filedialog.asksaveasfilename(defaultextension='.csv', filetypes=[('CSV files','*.csv')], initialfile=default_name, parent=self)
             if not filename: return
             cols = tree['columns']
             with open(filename, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
+                if extra_info:
+                    try:
+                        if isinstance(extra_info, dict):
+                            for k, v in extra_info.items(): writer.writerow([f"{k}: {v}"])
+                        else:
+                            writer.writerow([str(extra_info)])
+                    except Exception:
+                        try: writer.writerow([str(extra_info)])
+                        except: pass
                 # header
                 headers = [tree.heading(c)['text'] for c in cols]
                 writer.writerow(headers)
@@ -1462,15 +2058,18 @@ class CoolPropApp(tk.Tk):
 
     def _export_results_csv(self):
         if hasattr(self, 'result_tree'):
-            self._export_treeview_to_csv(self.result_tree, 'results.csv')
+            extra = self.current_fluid_for_plot if getattr(self, 'current_fluid_for_plot', None) else self.fluid_var.get()
+            self._export_treeview_to_csv(self.result_tree, 'results.csv', extra_info=extra)
 
     def _export_rankine_csv(self):
         if hasattr(self, 'rankine_tree'):
-            self._export_treeview_to_csv(self.rankine_tree, 'rankine_cycle.csv')
+            extra = self.current_fluid_for_plot if getattr(self, 'current_fluid_for_plot', None) else self.fluid_var.get()
+            self._export_treeview_to_csv(self.rankine_tree, 'rankine_cycle.csv', extra_info=extra)
 
     def _export_refrig_csv(self):
         if hasattr(self, 'refrig_tree'):
-            self._export_treeview_to_csv(self.refrig_tree, 'refrig_cycle.csv')
+            extra = self.current_fluid_for_plot if getattr(self, 'current_fluid_for_plot', None) else self.fluid_var.get()
+            self._export_treeview_to_csv(self.refrig_tree, 'refrig_cycle.csv', extra_info=extra)
 
     def _clear_ph_plot(self):
         try:
@@ -1483,7 +2082,29 @@ class CoolPropApp(tk.Tk):
             h_plot = self.Q_(calc_vals.get('H'),'J/kg').to('kJ/kg').m if isinstance(calc_vals.get('H'),(int,float)) else None
             p_plot = self.Q_(calc_vals.get('P'),'pascal').to('kPa').m if isinstance(calc_vals.get('P'),(int,float)) else None
             if redraw_dome or force_redraw_lines:
-                self._plot_ph_base(fluid_name, self.calculator.calculate_ph_dome(fluid_name))
+                # Run dome calculation in background to avoid blocking UI
+                def _on_ph_dome_done(dome, exc):
+                    if exc:
+                        logging.error(f"P-h dome generation failed: {exc}", exc_info=True)
+                        try:
+                            messagebox.showerror('P-h Dome Error', f'Could not calculate P-h dome:\n{exc}', parent=self)
+                        except Exception:
+                            pass
+                        return
+                    try:
+                        self._plot_ph_base(fluid_name, dome)
+                    except Exception:
+                        logging.exception('Failed to plot P-h dome after generation')
+
+                try:
+                    self._run_task_async(self.calculator.calculate_ph_dome, args=(fluid_name,), on_done=_on_ph_dome_done, title=f'Calculating P-h dome for {fluid_name}')
+                except Exception:
+                    # fallback synchronous
+                    try:
+                        self._set_busy(); dome = self.calculator.calculate_ph_dome(fluid_name)
+                    finally:
+                        self._clear_busy()
+                    self._plot_ph_base(fluid_name, dome)
             else:
                 for item in [i for i in (self.ph_ax.lines + self.ph_ax.collections + self.ph_ax.texts) if i.get_label() in ('state_point_marker', 'state_point_annot')]: item.remove()
             if h_plot is not None and p_plot is not None:
@@ -1509,7 +2130,29 @@ class CoolPropApp(tk.Tk):
             s_plot = self.Q_(calc_vals.get('S'),'J/(kg*K)').to('kJ/(kg*K)').m if isinstance(calc_vals.get('S'),(int,float)) else None
             t_plot = self.Q_(calc_vals.get('T'),'K').to('K').m if isinstance(calc_vals.get('T'),(int,float)) else None
             if redraw_dome or force_redraw_lines:
-                self._plot_ts_base(fluid_name, self.calculator.calculate_ts_dome(fluid_name))
+                # Run T-s dome calculation in background
+                def _on_ts_dome_done(dome, exc):
+                    if exc:
+                        logging.error(f"T-s dome generation failed: {exc}", exc_info=True)
+                        try:
+                            messagebox.showerror('T-s Dome Error', f'Could not calculate T-s dome:\n{exc}', parent=self)
+                        except Exception:
+                            pass
+                        return
+                    try:
+                        self._plot_ts_base(fluid_name, dome)
+                    except Exception:
+                        logging.exception('Failed to plot T-s dome after generation')
+
+                try:
+                    self._run_task_async(self.calculator.calculate_ts_dome, args=(fluid_name,), on_done=_on_ts_dome_done, title=f'Calculating T-s dome for {fluid_name}')
+                except Exception:
+                    # fallback synchronous
+                    try:
+                        self._set_busy(); dome = self.calculator.calculate_ts_dome(fluid_name)
+                    finally:
+                        self._clear_busy()
+                    self._plot_ts_base(fluid_name, dome)
             else:
                 for item in [i for i in (self.ts_ax.lines + self.ts_ax.collections + self.ts_ax.texts) if i.get_label() in ('state_point_marker_ts', 'state_point_annot_ts')]: item.remove()
             if s_plot is not None and t_plot is not None:
@@ -1556,6 +2199,32 @@ class CoolPropApp(tk.Tk):
         except Exception:
             return []
 
+    def _short_fluid_display(self, fluid_str):
+        """Return a short, human-friendly representation for a fluid string.
+        For HEOS mixtures, show components and fractions; otherwise return the fluid name.
+        """
+        if not fluid_str: return ''
+        try:
+            s = fluid_str
+            if '::' in s:
+                proto, rest = s.split('::', 1)
+                # For mixtures with &, keep compact
+                if '&' in rest:
+                    parts = rest.split('&')
+                    comps = []
+                    for p in parts:
+                        if '[' in p:
+                            name, frac = p.split('[', 1); frac = frac.strip(']')
+                            try: fracf = float(frac); comps.append(f"{name}:{fracf:.3f}")
+                            except: comps.append(name)
+                        else:
+                            comps.append(p)
+                    return proto + '::' + '&'.join(comps)
+                return rest
+            return fluid_str
+        except Exception:
+            return fluid_str
+
     def _on_plot_binary_bubble_dew(self):
         """Compute and plot bubble and dew T vs composition for a binary mixture at specified P (kPa)."""
         fluid = self.fluid_var.get()
@@ -1569,49 +2238,98 @@ class CoolPropApp(tk.Tk):
             messagebox.showerror('Binary Plot', 'Enter a valid pressure in kPa.', parent=self); return
         p_pa = self.Q_(p_kpa, 'kPa').to('Pa').m
         A, B = comps[0], comps[1]
-        N = 41
-        xs = np.linspace(0.0, 1.0, N)
-        T_bub = []
-        T_dew = []
-        for x in xs:
-            # build mixture string with mole fraction x for A
-            mix = f'HEOS::{A}[{x:.6f}]&{B}[{(1.0-x):.6f}]'
+        N = 81
+
+        def _compute():
+            xs = np.linspace(0.0, 1.0, N)
+            Tb_arr = np.full_like(xs, np.nan, dtype=float)
+            Td_arr = np.full_like(xs, np.nan, dtype=float)
+            for i, x in enumerate(xs):
+                # build mixture string with mole fraction x for A
+                mix = f'HEOS::{A}[{x:.6f}]&{B}[{(1.0-x):.6f}]'
+                try:
+                    Tb = CP.PropsSI('T', 'P', p_pa, 'Q', 0, mix)
+                    if np.isfinite(Tb): Tb_arr[i] = Tb
+                except Exception:
+                    Tb_arr[i] = np.nan
+                try:
+                    Td = CP.PropsSI('T', 'P', p_pa, 'Q', 1, mix)
+                    if np.isfinite(Td): Td_arr[i] = Td
+                except Exception:
+                    Td_arr[i] = np.nan
+            return {'x': xs, 'T_bub': Tb_arr, 'T_dew': Td_arr, 'A': A, 'B': B, 'p_kpa': p_kpa}
+
+        def _on_done(result, exc):
+            if exc:
+                logging.error(f'Binary bubble/dew calculation failed: {exc}', exc_info=True)
+                try: messagebox.showerror('Binary Plot', f'Calculation failed:\n{exc}', parent=self)
+                except: pass
+                return
             try:
-                Tb = CP.PropsSI('T', 'P', p_pa, 'Q', 0, mix)
-            except Exception:
-                Tb = np.nan
-            try:
-                Td = CP.PropsSI('T', 'P', p_pa, 'Q', 1, mix)
-            except Exception:
-                Td = np.nan
-            T_bub.append(Tb if np.isfinite(Tb) else np.nan)
-            T_dew.append(Td if np.isfinite(Td) else np.nan)
-        # Plot in a new figure: T vs x (mole frac of A)
+                xs = result['x']; T_bub = result['T_bub']; T_dew = result['T_dew']; A = result['A']; B = result['B']; p_kpa = result['p_kpa']
+                fig = Figure(figsize=(6,4), dpi=100); ax = fig.add_subplot(111)
+                # Plot only finite points and mark them
+                finite_bub = np.isfinite(T_bub)
+                finite_dew = np.isfinite(T_dew)
+                if finite_bub.any():
+                    ax.plot(xs[finite_bub], (T_bub[finite_bub]-273.15), 'b-', label=f'Bubble ({A})')
+                    ax.plot(xs[finite_bub], (T_bub[finite_bub]-273.15), 'bo', ms=3)
+                if finite_dew.any():
+                    ax.plot(xs[finite_dew], (T_dew[finite_dew]-273.15), 'r--', label=f'Dew ({B})')
+                    ax.plot(xs[finite_dew], (T_dew[finite_dew]-273.15), 'ro', ms=3)
+                ax.set_xlabel(f'Mole fraction {A} (mole fraction)')
+                ax.set_ylabel('Temperature (°C)')
+                ax.set_title(f'Binary Bubble/Dew @ {p_kpa:.3f} kPa for {A}/{B}')
+                ax.grid(True)
+                ax.set_xlim(0,1)
+                ax.set_xticks([0.0, 0.25, 0.5, 0.75, 1.0])
+                ax.set_xticklabels(['0', '25%', '50%', '75%', '100%'])
+                ax.legend(loc='best', fontsize='small')
+                # New window with Save CSV button
+                top = tk.Toplevel(self); top.title(f'Bubble/Dew: {A}/{B} @ {p_kpa} kPa')
+                toolbar = ttk.Frame(top); toolbar.pack(fill='x')
+                def _save_csv():
+                    try:
+                        filename = filedialog.asksaveasfilename(defaultextension='.csv', filetypes=[('CSV files','*.csv')], initialfile=f'bubble_dew_{A}_{B}_{p_kpa:.0f}kPa.csv', parent=top)
+                        if not filename: return
+                        with open(filename, 'w', newline='', encoding='utf-8') as f:
+                            w = csv.writer(f)
+                            w.writerow(['x_'+A, 'T_bubble_C', 'T_dew_C'])
+                            for xi, tb, td in zip(xs, T_bub, T_dew):
+                                tbc = tb-273.15 if np.isfinite(tb) else ''
+                                tdc = td-273.15 if np.isfinite(td) else ''
+                                w.writerow([f"{xi:.6f}", tbc, tdc])
+                        messagebox.showinfo('Export', f'Data saved to {filename}', parent=top)
+                    except Exception as e:
+                        logging.error(f'Failed to save CSV: {e}', exc_info=True); messagebox.showerror('Export Error', f'Could not save CSV: {e}', parent=top)
+                save_btn = ttk.Button(toolbar, text='Save CSV', command=_save_csv); save_btn.pack(side=tk.LEFT, padx=6, pady=4)
+                canvas = FigureCanvasTkAgg(fig, master=top); canvas.get_tk_widget().pack(fill='both', expand=True)
+                canvas.draw()
+            except Exception as e:
+                logging.error(f'Binary plot display failed: {e}', exc_info=True);
+                try: messagebox.showerror('Binary Plot', f'Could not display plot: {e}', parent=self)
+                except: pass
+
         try:
-            fig = Figure(figsize=(6,4), dpi=100)
-            ax = fig.add_subplot(111)
-            ax.plot(xs, np.array(T_bub)-273.15, 'b-', label='Bubble (T °C)')
-            ax.plot(xs, np.array(T_dew)-273.15, 'r--', label='Dew (T °C)')
-            ax.set_xlabel(f'Mole fraction {A}')
-            ax.set_ylabel('Temperature (°C)')
-            ax.set_title(f'Binary Bubble/Dew @ {p_kpa:.3f} kPa for {A}/{B}')
-            ax.grid(True); ax.legend()
-            # show in a Tk window
-            top = tk.Toplevel(self)
-            top.title(f'Bubble/Dew: {A}/{B} @ {p_kpa} kPa')
-            canvas = FigureCanvasTkAgg(fig, master=top)
-            canvas.get_tk_widget().pack(fill='both', expand=True)
-            canvas.draw()
-        except Exception as e:
-            logging.error(f'Binary plot failed: {e}', exc_info=True)
-            messagebox.showerror('Binary Plot', f'Could not display plot: {e}', parent=self)
+            self._run_task_async(_compute, on_done=_on_done, title=f'Binary Bubble/Dew {A}/{B} @ {p_kpa} kPa')
+        except Exception:
+            # fallback synchronous
+            try:
+                self._set_busy(); res = _compute()
+            finally:
+                self._clear_busy()
+            _on_done(res, None)
 
     def _update_psat_plot(self, fluid_name):
         if not fluid_name or not hasattr(self, 'psat_ax'): self._clear_psat_plot(); return
         logging.info(f"Updating P-T Saturation plot for {fluid_name}")
         self._clear_psat_plot()
         try:
-            psat_data = self.calculator.calculate_psat_vs_t(fluid_name)
+            try:
+                self._set_busy()
+                psat_data = self.calculator.calculate_psat_vs_t(fluid_name)
+            finally:
+                self._clear_busy()
             if psat_data.get('error'): self.psat_ax.set_title(f"P-T Saturation - {fluid_name} (Error)")
             elif psat_data.get('t') is not None:
                 self.psat_ax.plot(psat_data['t'], psat_data['p'], 'b-', lw=1.5, zorder=5)
@@ -1625,6 +2343,21 @@ class CoolPropApp(tk.Tk):
             else: self.psat_ax.set_title(f"P-T Saturation - {fluid_name} (No Data)")
             self.psat_fig.tight_layout(); self.psat_canvas.draw_idle()
         except Exception as e: logging.error(f"Error updating P-T plot: {e}")
+        # annotate with mixture/ composition
+        try:
+            for t in list(self.psat_ax.texts):
+                try:
+                    if getattr(t, 'get_gid', lambda: None)() == 'mixture_label': t.remove()
+                except Exception:
+                    try: t.remove()
+                    except Exception: pass
+            disp = self._short_fluid_display(fluid_name)
+            if disp:
+                txt = self.psat_ax.text(0.98, 0.02, disp, transform=self.psat_ax.transAxes, ha='right', va='bottom', fontsize='8', bbox=dict(fc='white', alpha=0.7, pad=2))
+                try: txt.set_gid('mixture_label')
+                except: pass
+        except Exception:
+            pass
 
     def _clear_rankine_results(self):
         if hasattr(self, 'rankine_tree'):
@@ -1665,6 +2398,59 @@ class CoolPropApp(tk.Tk):
             self._update_cycle_plots(cycle_results, fluid, redraw_base=True)
         except Exception as e: messagebox.showerror("Error", f"Rankine error:\n{e}"); logging.error(f"Rankine error: {e}")
 
+    def _calculate_brayton_orchestrator(self):
+        fluid = self.fluid_var.get()
+        try:
+            t1_c = float(self.brayton_t1_var.get()); p1_kpa = float(self.brayton_p1_var.get()); pr = float(self.brayton_pr_var.get())
+            t3_c = float(self.brayton_t3_var.get()); eta_c = float(self.brayton_eta_comp_var.get())/100.0; eta_t = float(self.brayton_eta_turb_var.get())/100.0
+            mdot = float(self.brayton_mdot_var.get()) if self.brayton_mdot_var.get() else 1.0
+        except Exception as e:
+            messagebox.showerror('Input Error', f'Invalid Brayton input: {e}', parent=self); return
+        # Convert to SI
+        p1_pa = self.Q_(p1_kpa, 'kPa').to('Pa').m
+        t1_k = self.Q_(t1_c, 'degC').to('K').m
+        t3_k = self.Q_(t3_c, 'degC').to('K').m
+        # calculate
+        try:
+            results = self.calculator.calculate_brayton_cycle(fluid, p1_pa, t1_k, pr, t3_k, eta_c, eta_t, mdot)
+            if results.get('error'):
+                messagebox.showerror('Calculation Error', results['error'], parent=self); return
+            # populate tree
+            for item in self.brayton_tree.get_children(): self.brayton_tree.delete(item)
+            states = results.get('states', {})
+            for n in sorted(states.keys()):
+                s = states[n]
+                self.brayton_tree.insert('', tk.END, values=(n, f"{self.Q_(s.get('T',0),'K').to('degC').m:.2f}", f"{self.Q_(s.get('P',0),'Pa').to('kPa').m:.2f}", f"{self.Q_(s.get('H',0),'J/kg').to('kJ/kg').m:.2f}", f"{self.Q_(s.get('S',0),'J/(kg*K)').to('kJ/(kg*K)').m:.4f}"))
+            # metrics
+            m = results.get('metrics', {})
+            msg = f"W_net: {self.Q_(m.get('W_net',0),'J/kg').to('kJ/kg').m:.2f} kJ/kg, η={m.get('eta',0)*100:.2f}%"
+            messagebox.showinfo('Brayton Results', msg, parent=self)
+            # plot on T-s (reuse ts axes)
+            self._update_brayton_plot(results, fluid)
+        except Exception as e:
+            logging.error(f'Brayton orchestrator error: {e}', exc_info=True); messagebox.showerror('Error', f'Brayton error:\n{e}', parent=self)
+
+    def _update_brayton_plot(self, cycle_results, fluid_name):
+        try:
+            states = cycle_results.get('states', {})
+            if not states: return
+            t_vals = []; s_vals = []
+            for i in sorted(states.keys()):
+                st = states[i]
+                t_vals.append(self.Q_(st.get('T',np.nan),'K').to('K').m)
+                s_vals.append(self.Q_(st.get('S',np.nan),'J/(kg*K)').to('kJ/(kg*K)').m)
+            # remove previous brayton lines/points
+            for item in [i for i in (self.ts_ax.lines + self.ts_ax.collections + self.ts_ax.texts) if getattr(i,'get_label',lambda:None)() in ('brayton_line','brayton_point','brayton_label')]:
+                try: item.remove()
+                except Exception: pass
+            # plot cycle lines on T-s
+            self.ts_ax.plot(s_vals+[s_vals[0]], t_vals+[t_vals[0]], 'g-', lw=1.2, label='brayton_line', zorder=12)
+            for idx, (sv,tv) in enumerate(zip(s_vals, t_vals)):
+                self.ts_ax.plot(sv, tv, 'go', ms=5, label='brayton_point', zorder=13); self.ts_ax.text(sv, tv, f' {idx+1}', color='green', fontsize=8, label='brayton_label', zorder=14)
+            self.ts_canvas.draw_idle()
+        except Exception as e:
+            logging.error(f'Brayton plot error: {e}', exc_info=True)
+
     def _update_cycle_plots(self, cycle_results, fluid_name, redraw_base):
         states = cycle_results.get('states');
         if not states: return
@@ -1674,7 +2460,58 @@ class CoolPropApp(tk.Tk):
                 s = states[i]; h_p.append(self.Q_(s.get('H',np.nan),'J/kg').to('kJ/kg').m); p_p.append(self.Q_(s.get('P',np.nan),'Pa').to('kPa').m); t_p.append(s.get('T',np.nan)); s_p.append(self.Q_(s.get('S',np.nan),'J/(kg*K)').to('kJ/(kg*K)').m)
             if any(isnan(v) for v in h_p+p_p+s_p+t_p): return
             self._clear_cycle_lines_from_plots()
-            if redraw_base: self._plot_ph_base(fluid_name, self.calculator.calculate_ph_dome(fluid_name)); self._plot_ts_base(fluid_name, self.calculator.calculate_ts_dome(fluid_name))
+            if redraw_base:
+                # compute domes in background then plot domes and cycle
+                def _domes_worker():
+                    ph = self.calculator.calculate_ph_dome(fluid_name)
+                    ts = self.calculator.calculate_ts_dome(fluid_name)
+                    return (ph, ts)
+
+                def _on_domes_done(result, exc):
+                    if exc:
+                        logging.error(f"Dome generation failed: {exc}", exc_info=True)
+                        try:
+                            messagebox.showerror('Dome Error', f'Could not calculate domes:\n{exc}', parent=self)
+                        except Exception:
+                            pass
+                        # continue to attempt plotting cycle without domes
+                    else:
+                        try:
+                            ph_dome, ts_dome = result
+                            self._plot_ph_base(fluid_name, ph_dome)
+                            self._plot_ts_base(fluid_name, ts_dome)
+                        except Exception:
+                            logging.exception('Failed plotting domes after generation')
+                    # plot cycle lines & points (always run on main thread)
+                    try:
+                        self.ph_ax.plot(h_p+[h_p[0]], p_p+[p_p[0]], 'r-', lw=1.0, label='cycle_line', zorder=11)
+                        self.ts_ax.plot(s_p+[s_p[0]], t_p+[t_p[0]], 'r-', lw=1.0, label='cycle_line', zorder=11)
+                        for i, pt in enumerate(pts):
+                            self.ph_ax.plot(h_p[i], p_p[i], 'ro', ms=5, label='cycle_point', zorder=12); self.ph_ax.text(h_p[i], p_p[i], f' {pt}', color='red', fontsize=9, label='cycle_label', zorder=13)
+                            self.ts_ax.plot(s_p[i], t_p[i], 'ro', ms=5, label='cycle_point', zorder=12); self.ts_ax.text(s_p[i], t_p[i], f' {pt}', color='red', fontsize=9, label='cycle_label', zorder=13)
+                        self.ph_canvas.draw_idle(); self.ts_canvas.draw_idle()
+                    except Exception:
+                        logging.exception('Failed to draw cycle lines after domes')
+
+                try:
+                    self._run_task_async(_domes_worker, args=(), on_done=_on_domes_done, title=f'Generating domes for {fluid_name}')
+                except Exception:
+                    # fallback synchronous
+                    try:
+                        self._set_busy(); ph_dome = self.calculator.calculate_ph_dome(fluid_name); ts_dome = self.calculator.calculate_ts_dome(fluid_name)
+                    finally:
+                        self._clear_busy()
+                    try:
+                        self._plot_ph_base(fluid_name, ph_dome); self._plot_ts_base(fluid_name, ts_dome)
+                    except Exception:
+                        logging.exception('Failed to plot domes in fallback')
+                    self.ph_ax.plot(h_p+[h_p[0]], p_p+[p_p[0]], 'r-', lw=1.0, label='cycle_line', zorder=11); self.ts_ax.plot(s_p+[s_p[0]], t_p+[t_p[0]], 'r-', lw=1.0, label='cycle_line', zorder=11)
+                    for i, pt in enumerate(pts):
+                        self.ph_ax.plot(h_p[i], p_p[i], 'ro', ms=5, label='cycle_point', zorder=12); self.ph_ax.text(h_p[i], p_p[i], f' {pt}', color='red', fontsize=9, label='cycle_label', zorder=13)
+                        self.ts_ax.plot(s_p[i], t_p[i], 'ro', ms=5, label='cycle_point', zorder=12); self.ts_ax.text(s_p[i], t_p[i], f' {pt}', color='red', fontsize=9, label='cycle_label', zorder=13)
+                    self.ph_canvas.draw_idle(); self.ts_canvas.draw_idle()
+                return
+            # if not redraw_base, just plot cycle
             self.ph_ax.plot(h_p+[h_p[0]], p_p+[p_p[0]], 'r-', lw=1.0, label='cycle_line', zorder=11); self.ts_ax.plot(s_p+[s_p[0]], t_p+[t_p[0]], 'r-', lw=1.0, label='cycle_line', zorder=11)
             for i, pt in enumerate(pts):
                 self.ph_ax.plot(h_p[i], p_p[i], 'ro', ms=5, label='cycle_point', zorder=12); self.ph_ax.text(h_p[i], p_p[i], f' {pt}', color='red', fontsize=9, label='cycle_label', zorder=13)
@@ -1857,6 +2694,40 @@ class CoolPropApp(tk.Tk):
         calc_btn = ttk.Button(input_frame, text="Calculate Properties", command=self._calculate_psychro_orchestrator)
         calc_btn.grid(row=3, column=0, columnspan=3, pady=10)
 
+        # --- Mixing Inputs ---
+        mix_frame = ttk.LabelFrame(parent_frame, text='Mix Two Air Streams', padding=8)
+        mix_frame.grid(row=1, column=0, padx=5, pady=(2,5), sticky='new')
+        # Stream A
+        sa = ttk.LabelFrame(mix_frame, text='Stream A', padding=6); sa.grid(row=0, column=0, padx=5, pady=3, sticky='nw')
+        ttk.Label(sa, text='Mass flow (kg/s):').grid(row=0, column=0, sticky='w'); self.mix_mdot1_var = tk.StringVar(value='1.0'); ttk.Entry(sa, textvariable=self.mix_mdot1_var, width=10).grid(row=0, column=1, padx=4)
+        ttk.Label(sa, text='T (°C):').grid(row=1, column=0, sticky='w'); self.mix_t1_var = tk.StringVar(value='30'); ttk.Entry(sa, textvariable=self.mix_t1_var, width=10).grid(row=1, column=1, padx=4)
+        ttk.Label(sa, text='RH (%):').grid(row=2, column=0, sticky='w'); self.mix_rh1_var = tk.StringVar(value='50'); ttk.Entry(sa, textvariable=self.mix_rh1_var, width=10).grid(row=2, column=1, padx=4)
+        # Stream B
+        sb = ttk.LabelFrame(mix_frame, text='Stream B', padding=6); sb.grid(row=0, column=1, padx=5, pady=3, sticky='ne')
+        ttk.Label(sb, text='Mass flow (kg/s):').grid(row=0, column=0, sticky='w'); self.mix_mdot2_var = tk.StringVar(value='1.0'); ttk.Entry(sb, textvariable=self.mix_mdot2_var, width=10).grid(row=0, column=1, padx=4)
+        ttk.Label(sb, text='T (°C):').grid(row=1, column=0, sticky='w'); self.mix_t2_var = tk.StringVar(value='20'); ttk.Entry(sb, textvariable=self.mix_t2_var, width=10).grid(row=1, column=1, padx=4)
+        ttk.Label(sb, text='RH (%):').grid(row=2, column=0, sticky='w'); self.mix_rh2_var = tk.StringVar(value='30'); ttk.Entry(sb, textvariable=self.mix_rh2_var, width=10).grid(row=2, column=1, padx=4)
+        # pressure for mixing
+        ttk.Label(mix_frame, text='Pressure (kPa):').grid(row=0, column=2, sticky='w', padx=(8,2)); self.mix_p_var = tk.StringVar(value='101.325'); ttk.Entry(mix_frame, textvariable=self.mix_p_var, width=10).grid(row=0, column=3, padx=4)
+        mix_btn = ttk.Button(mix_frame, text='Mix Streams', command=self._calculate_mixing_orchestrator)
+        mix_btn.grid(row=0, column=4, padx=8)
+        chart_btn = ttk.Button(mix_frame, text='Show Psychro Chart', command=self._show_psychro_chart)
+        chart_btn.grid(row=0, column=5, padx=4)
+
+        # --- Mix History ---
+        hist_frame = ttk.LabelFrame(parent_frame, text='Mix History', padding=8)
+        hist_frame.grid(row=1, column=1, padx=5, pady=(2,5), sticky='nsew')
+        hist_frame.grid_rowconfigure(0, weight=1); hist_frame.grid_columnconfigure(0, weight=1)
+        self.mix_history_listbox = tk.Listbox(hist_frame, height=6, exportselection=False)
+        self.mix_history_listbox.grid(row=0, column=0, sticky='nsew')
+        hist_scroll = ttk.Scrollbar(hist_frame, orient=tk.VERTICAL, command=self.mix_history_listbox.yview)
+        self.mix_history_listbox.configure(yscrollcommand=hist_scroll.set); hist_scroll.grid(row=0, column=1, sticky='ns')
+        hist_btns = ttk.Frame(hist_frame)
+        hist_btns.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(6,0))
+        ttk.Button(hist_btns, text='Replot Selected', command=self._replot_selected_mix).pack(side=tk.LEFT, padx=3)
+        ttk.Button(hist_btns, text='Remove Selected', command=self._remove_selected_mix).pack(side=tk.LEFT, padx=3)
+        ttk.Button(hist_btns, text='Clear History', command=self._clear_mix_history).pack(side=tk.LEFT, padx=3)
+
         # --- Results Frame ---
         results_frame = ttk.LabelFrame(parent_frame, text="Humid Air Properties", padding="10")
         results_frame.grid(row=0, column=1, padx=5, pady=5, sticky="nsew")
@@ -1881,7 +2752,7 @@ class CoolPropApp(tk.Tk):
     def _calculate_psychro_orchestrator(self):
         # Clear previous
         for item in self.psychro_tree.get_children(): self.psychro_tree.delete(item)
-        
+
         try:
             # Get & Convert Inputs
             t_db_c = float(self.psychro_tdb_var.get())
@@ -1892,60 +2763,271 @@ class CoolPropApp(tk.Tk):
             rh_frac = rh_percent / 100.0
             p_pa = self.Q_(p_kpa, 'kPa').to('Pa').m
 
-            # Calculate
-            result = self.calculator.calculate_humid_air_properties(t_db_k, rh_frac, p_pa)
+        except ValueError as ve:
+            messagebox.showerror("Input Error", f"Invalid numeric input: {ve}", parent=self); return
+        except Exception as e:
+            messagebox.showerror("Error", f"Invalid input: {e}", parent=self); logging.error(f"Psychro Orchestrator input error: {e}", exc_info=True); return
 
-            if result.get('error'):
-                messagebox.showerror("Psychro Error", result['error'], parent=self)
+        def _on_psychro_done(result, exc):
+            if exc:
+                logging.error(f"Psychro calc failed: {exc}", exc_info=True)
+                try: messagebox.showerror('Psychro Error', f'Calculation failed:\n{exc}', parent=self)
+                except Exception: pass
                 return
-
-            # Display Results (Unit Conversions for readability)
-            props = result.get('properties', {})
-            
-            # Define display logic: Key -> (Description, DisplayUnitPintStr, DisplayFormat)
+            res = result
+            if res.get('error'):
+                try: messagebox.showerror('Psychro Error', res['error'], parent=self)
+                except Exception: pass
+                return
+            props = res.get('properties', {})
             display_map = {
                 'Tdp': ('Dew Point Temp', 'degC', '.2f'),
                 'Twb': ('Wet Bulb Temp', 'degC', '.2f'),
-                'W':   ('Humidity Ratio', 'dimensionless', '.5f'), # kg_w/kg_da
-                'H':   ('Specific Enthalpy', 'kJ/kg', '.2f'),      # per kg dry air
-                'V':   ('Specific Volume', 'm**3/kg', '.4f'),      # per kg dry air
-                'M':   ('Viscosity', 'uPa*s', '.2f'),
+                'W':   ('Humidity Ratio', 'dimensionless', '.5f'),
+                'H':   ('Specific Enthalpy', 'kJ/kg', '.2f'),
+                'V':   ('Specific Volume', 'm**3/kg', '.4f'),
+                'M':   ('Viscosity', 'Pa*s', '.2f'),
                 'K':   ('Conductivity', 'W/(m*K)', '.4f')
             }
+            try:
+                for key, val in props.items():
+                    if val is None: continue
+                    desc, unit_str, fmt = display_map.get(key, (key, '', '.4f'))
+                    try:
+                        si_unit = 'K' if key in ['Tdp', 'Twb'] else ('J/kg' if key=='H' else ('m**3/kg' if key=='V' else ('Pa*s' if key=='M' else ('W/(m*K)' if key=='K' else 'dimensionless'))))
+                        qty = self.Q_(val, si_unit)
+                        if key == 'W':
+                            disp_val = f"{val:{fmt}}"
+                            disp_unit = "kg_w/kg_da"
+                        else:
+                            qty_conv = qty.to(unit_str)
+                            disp_val = f"{qty_conv.magnitude:{fmt}}"
+                            disp_unit = f"{qty_conv.units:~P}"
+                        self.psychro_tree.insert('', tk.END, values=(desc, disp_val, disp_unit))
+                    except Exception as e:
+                        logging.error(f"Formatting error for {key}: {e}")
+                        self.psychro_tree.insert('', tk.END, values=(desc, str(val), "Error"))
+            except Exception as e:
+                logging.error(f"Error updating psychro display: {e}", exc_info=True)
 
-            for key, val in props.items():
-                if val is None: continue
-                desc, unit_str, fmt = display_map.get(key, (key, '', '.4f'))
-                
-                # Conversion handling
-                try:
-                    # SI Unit coming from CoolProp
-                    si_unit = 'K' if key in ['Tdp', 'Twb'] else ('J/kg' if key=='H' else ('m**3/kg' if key=='V' else ('Pa*s' if key=='M' else ('W/(m*K)' if key=='K' else 'dimensionless'))))
-                    
-                    qty = self.Q_(val, si_unit)
-                    
-                    if key == 'W':
-                        # Special case for W: show as kg/kg (dimensionless) or g/kg? 
-                        # Let's show kg/kg for standard, maybe append g/kg in text
-                        disp_val = f"{val:{fmt}}"
-                        disp_unit = "kg_w/kg_da"
-                        # Add g/kg row ? optional.
-                    else:
-                        qty_conv = qty.to(unit_str)
-                        disp_val = f"{qty_conv.magnitude:{fmt}}"
-                        disp_unit = f"{qty_conv.units:~P}"
-                    
-                    self.psychro_tree.insert('', tk.END, values=(desc, disp_val, disp_unit))
-                    
-                except Exception as e:
-                    logging.error(f"Formatting error for {key}: {e}")
-                    self.psychro_tree.insert('', tk.END, values=(desc, str(val), "Error"))
-
-        except ValueError as ve:
-            messagebox.showerror("Input Error", f"Invalid numeric input: {ve}", parent=self)
+        # Run calculation in background
+        try:
+            self._run_task_async(self.calculator.calculate_humid_air_properties, args=(t_db_k, rh_frac, p_pa), on_done=_on_psychro_done, title='Calculating humid air properties')
         except Exception as e:
-            messagebox.showerror("Error", f"Calculation failed: {e}", parent=self)
-            logging.error(f"Psychro Orchestrator Error: {e}", exc_info=True)
+            logging.error(f"Failed to start async psychro task: {e}", exc_info=True)
+            # fallback synchronous
+            try:
+                res = self.calculator.calculate_humid_air_properties(t_db_k, rh_frac, p_pa)
+                _on_psychro_done(res, None)
+            except Exception as ee:
+                logging.error(f"Psychro fallback failed: {ee}", exc_info=True); messagebox.showerror('Psychro Error', f'Could not calculate: {ee}', parent=self)
+
+    def _calculate_mixing_orchestrator(self):
+        # Clear previous mixed row
+        try:
+            for item in self.psychro_tree.get_children(): self.psychro_tree.delete(item)
+        except: pass
+        try:
+            md1 = float(self.mix_mdot1_var.get()); t1_c = float(self.mix_t1_var.get()); rh1 = float(self.mix_rh1_var.get())/100.0
+            md2 = float(self.mix_mdot2_var.get()); t2_c = float(self.mix_t2_var.get()); rh2 = float(self.mix_rh2_var.get())/100.0
+            p_kpa = float(self.mix_p_var.get()); p_pa = self.Q_(p_kpa, 'kPa').to('Pa').m
+        except Exception as e:
+            messagebox.showerror('Input Error', f'Invalid mixing input: {e}', parent=self); return
+        t1_k = self.Q_(t1_c, 'degC').to('K').m; t2_k = self.Q_(t2_c, 'degC').to('K').m
+        res = self.calculator.calculate_mixed_air(md1, t1_k, rh1, md2, t2_k, rh2, p_pa)
+        if res.get('error'):
+            messagebox.showerror('Mix Error', res['error'], parent=self); return
+        mixed = res.get('mixed', {})
+        # Add to history
+        try:
+            entry = {'mdot1': md1, 't1_c': t1_c, 'rh1': rh1*100.0, 'mdot2': md2, 't2_c': t2_c, 'rh2': rh2*100.0, 'p_kpa': p_kpa}
+            self._add_mix_to_history(entry)
+        except Exception:
+            pass
+        # insert stream rows and mixed row
+        try:
+            streams = res.get('streams', {})
+            for i in [1,2]:
+                s = streams.get(i)
+                if not s: continue
+                self.psychro_tree.insert('', tk.END, values=(f"Stream {i} - W", f"{s.get('W',0):.5f}", 'kg/kg'))
+                self.psychro_tree.insert('', tk.END, values=(f"Stream {i} - H", f"{self.Q_(s.get('H',0),'J/kg').to('kJ/kg').m:.2f}", 'kJ/kg'))
+        except Exception:
+            pass
+        try:
+            Tmix_c = self.Q_(mixed.get('T',0), 'K').to('degC').m
+            RHmix = mixed.get('RH', 0)
+            Wmix = mixed.get('W', 0)
+            Hmix = mixed.get('H', 0)
+            self.psychro_tree.insert('', tk.END, values=('Mixed - T', f"{Tmix_c:.2f}", '°C'))
+            self.psychro_tree.insert('', tk.END, values=('Mixed - RH', f"{RHmix*100:.2f}", '%'))
+            self.psychro_tree.insert('', tk.END, values=('Mixed - W', f"{Wmix:.5f}", 'kg/kg'))
+            self.psychro_tree.insert('', tk.END, values=('Mixed - H', f"{self.Q_(Hmix,'J/kg').to('kJ/kg').m:.2f}", 'kJ/kg'))
+        except Exception as e:
+            logging.error(f"Error displaying mixed results: {e}", exc_info=True)
+
+    def _add_mix_to_history(self, entry):
+        try:
+            # push front
+            self.mix_history.insert(0, entry)
+            # cap length
+            if len(self.mix_history) > self.mix_history_limit: self.mix_history = self.mix_history[:self.mix_history_limit]
+            self._update_mix_history_display()
+        except Exception as e:
+            logging.error(f"Could not add mix to history: {e}", exc_info=True)
+
+    def _update_mix_history_display(self):
+        try:
+            self.mix_history_listbox.delete(0, tk.END)
+            for ent in self.mix_history:
+                label = f"A:{ent['t1_c']:.1f}C/{ent['rh1']:.0f}%@{ent['mdot1']}kg/s | B:{ent['t2_c']:.1f}C/{ent['rh2']:.0f}%@{ent['mdot2']}kg/s | P:{ent['p_kpa']}kPa"
+                self.mix_history_listbox.insert(tk.END, label)
+        except Exception as e:
+            logging.error(f"Could not update mix history display: {e}", exc_info=True)
+
+    def _replot_selected_mix(self):
+        try:
+            sel = self.mix_history_listbox.curselection()
+            if not sel: return
+            idx = sel[0]
+            ent = self.mix_history[idx]
+            # populate inputs
+            self.mix_mdot1_var.set(str(ent.get('mdot1',1.0))); self.mix_t1_var.set(str(ent.get('t1_c',25)))
+            self.mix_rh1_var.set(str(ent.get('rh1',50))); self.mix_mdot2_var.set(str(ent.get('mdot2',1.0)))
+            self.mix_t2_var.set(str(ent.get('t2_c',20))); self.mix_rh2_var.set(str(ent.get('rh2',30)))
+            self.mix_p_var.set(str(ent.get('p_kpa', self.psychro_p_var.get())))
+            # trigger compute
+            self._calculate_mixing_orchestrator()
+        except Exception as e:
+            logging.error(f"Could not replot selected mix: {e}", exc_info=True)
+
+    def _remove_selected_mix(self):
+        try:
+            sel = self.mix_history_listbox.curselection();
+            if not sel: return
+            idx = sel[0]; del self.mix_history[idx]; self._update_mix_history_display()
+        except Exception as e:
+            logging.error(f"Could not remove selected mix: {e}", exc_info=True)
+
+    def _clear_mix_history(self):
+        try: self.mix_history = []; self._update_mix_history_display()
+        except Exception as e: logging.error(f"Could not clear mix history: {e}", exc_info=True)
+
+    def _show_psychro_chart(self):
+        # Gather plot parameters
+        try:
+            p_kpa = float(self.mix_p_var.get())
+        except Exception:
+            try:
+                p_kpa = float(self.psychro_p_var.get())
+            except Exception:
+                p_kpa = float(self.psychro_p_var.get())
+        try:
+            tmin_c = float(self.psychro_chart_tmin_var.get())
+        except Exception:
+            tmin_c = -10.0
+        try:
+            tmax_c = float(self.psychro_chart_tmax_var.get())
+        except Exception:
+            tmax_c = 50.0
+        p_pa = self.Q_(p_kpa, 'kPa').to('Pa').m
+
+        def _on_chart_data(result, exception):
+            if exception:
+                logging.error(f'Psychro chart generation failed: {exception}', exc_info=True)
+                messagebox.showerror('Chart Error', f'Could not generate chart data: {exception}', parent=self)
+                return
+            data = result
+            if data.get('error'):
+                messagebox.showerror('Chart Error', data['error'], parent=self)
+                return
+            try:
+                fig = Figure(figsize=(7,5), dpi=100)
+                ax = fig.add_subplot(111)
+                # plot RH lines
+                for rh, (T_c, W) in data['rh_lines'].items():
+                    ax.plot(T_c, W, color='gray' if rh<1.0 else 'k', ls='-', lw=0.8, alpha=0.7)
+                    if rh in (0.2, 0.5, 0.8, 1.0):
+                        mid = len(T_c)//2
+                        try:
+                            ax.text(T_c[mid], W[mid], f'{int(rh*100)}%', fontsize=8, color='gray')
+                        except Exception:
+                            pass
+
+                # plot streams and optionally annotate enthalpy / wet-bulb
+                try:
+                    md1 = float(self.mix_mdot1_var.get()); t1_c = float(self.mix_t1_var.get()); rh1 = float(self.mix_rh1_var.get())/100.0
+                    md2 = float(self.mix_mdot2_var.get()); t2_c = float(self.mix_t2_var.get()); rh2 = float(self.mix_rh2_var.get())/100.0
+                    t1k = self.Q_(t1_c, 'degC').to('K').m; t2k = self.Q_(t2_c, 'degC').to('K').m
+                    W1 = CP.HAPropsSI('W', 'T', t1k, 'R', rh1, 'P', p_pa); W2 = CP.HAPropsSI('W', 'T', t2k, 'R', rh2, 'P', p_pa)
+                    ax.plot([t1_c], [W1], 'bo', label='Stream A'); ax.plot([t2_c], [W2], 'ro', label='Stream B')
+                    # compute mixed to show
+                    mix_res = self.calculator.calculate_mixed_air(md1, t1k, rh1, md2, t2k, rh2, p_pa)
+                    if mix_res.get('mixed'):
+                        Tmix_c = self.Q_(mix_res['mixed']['T'], 'K').to('degC').m; Wmix = mix_res['mixed']['W']
+                        ax.plot([Tmix_c], [Wmix], 'gs', label='Mixed')
+                        # optional annotations: enthalpy and wet-bulb
+                        if self.psychro_show_enthalpy_var.get():
+                            try:
+                                Hmix = mix_res['mixed']['H']
+                                ax.annotate(f'H={self.Q_(Hmix,"J/kg").to("kJ/kg").m:.1f} kJ/kg', (Tmix_c, Wmix), xytext=(8,8), textcoords='offset points', fontsize=8, color='green')
+                            except Exception:
+                                pass
+                        if self.psychro_show_wetbulb_var.get():
+                            try:
+                                Twb_mix_k = CP.HAPropsSI('Twb', 'T', self.Q_(Tmix_c,'degC').to('K').m, 'P', p_pa, 'W', Wmix)
+                                Twb_mix_c = self.Q_(Twb_mix_k, 'K').to('degC').m
+                                ax.annotate(f'Twb={Twb_mix_c:.1f}°C', (Tmix_c, Wmix), xytext=(8,-12), textcoords='offset points', fontsize=8, color='green')
+                            except Exception:
+                                pass
+                    # annotate streams as well
+                    if self.psychro_show_enthalpy_var.get():
+                        try:
+                            H1 = CP.HAPropsSI('H', 'T', t1k, 'R', rh1, 'P', p_pa);
+                            H2 = CP.HAPropsSI('H', 'T', t2k, 'R', rh2, 'P', p_pa);
+                            ax.annotate(f'H={self.Q_(H1,"J/kg").to("kJ/kg").m:.1f} kJ/kg', (t1_c, W1), xytext=(6,6), textcoords='offset points', fontsize=8, color='blue')
+                            ax.annotate(f'H={self.Q_(H2,"J/kg").to("kJ/kg").m:.1f} kJ/kg', (t2_c, W2), xytext=(6,6), textcoords='offset points', fontsize=8, color='red')
+                        except Exception:
+                            pass
+                    if self.psychro_show_wetbulb_var.get():
+                        try:
+                            Twb1_k = CP.HAPropsSI('Twb', 'T', t1k, 'R', rh1, 'P', p_pa); Twb2_k = CP.HAPropsSI('Twb', 'T', t2k, 'R', rh2, 'P', p_pa)
+                            Twb1_c = self.Q_(Twb1_k, 'K').to('degC').m; Twb2_c = self.Q_(Twb2_k, 'K').to('degC').m
+                            ax.annotate(f'Twb={Twb1_c:.1f}°C', (t1_c, W1), xytext=(6,-12), textcoords='offset points', fontsize=8, color='blue')
+                            ax.annotate(f'Twb={Twb2_c:.1f}°C', (t2_c, W2), xytext=(6,-12), textcoords='offset points', fontsize=8, color='red')
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                ax.set_xlabel('Dry Bulb Temp (°C)'); ax.set_ylabel('Humidity Ratio (kg/kg)'); ax.grid(True)
+                ax.set_title(f'Psychrometric Chart @ {p_kpa:.3f} kPa')
+                ax.legend()
+
+                top = tk.Toplevel(self); top.title('Psychrometric Chart')
+                ctl_frame = ttk.Frame(top)
+                ctl_frame.pack(side=tk.TOP, fill='x', padx=6, pady=4)
+                # Overlay toggles
+                ttk.Checkbutton(ctl_frame, text='Show Enthalpy Annotations', variable=self.psychro_show_enthalpy_var, onvalue=True, offvalue=False).pack(side=tk.LEFT, padx=6)
+                ttk.Checkbutton(ctl_frame, text='Show Wet-Bulb Annotations', variable=self.psychro_show_wetbulb_var, onvalue=True, offvalue=False).pack(side=tk.LEFT, padx=6)
+
+                canvas = FigureCanvasTkAgg(fig, master=top); canvas.get_tk_widget().pack(fill='both', expand=True)
+                canvas.draw()
+            except Exception as e:
+                logging.error(f'Chart display failed: {e}', exc_info=True)
+                messagebox.showerror('Chart Error', f'Could not display chart: {e}', parent=self)
+
+        # Run the potentially expensive chart data generation in background
+        try:
+            self._run_task_async(self.calculator.psychrometric_chart_data, args=(p_pa,), kwargs={'t_min_c': tmin_c, 't_max_c': tmax_c, 'N': 241}, on_done=_on_chart_data, title='Generating Psychrometric Chart')
+        except Exception as e:
+            logging.error(f'Failed to start async psychro chart task: {e}', exc_info=True)
+            # fallback to synchronous
+            try:
+                data = self.calculator.psychrometric_chart_data(p_pa, t_min_c=tmin_c, t_max_c=tmax_c, N=241)
+                _on_chart_data(data, None)
+            except Exception as ee:
+                logging.error(f'Chart fallback failed: {ee}', exc_info=True); messagebox.showerror('Chart Error', f'Could not generate chart: {ee}', parent=self)
 if __name__ == "__main__":
     try: from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
     except: pass
