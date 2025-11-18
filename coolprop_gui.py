@@ -58,7 +58,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # --- Pint Unit Registry ---
 ureg = pint.UnitRegistry(autoconvert_offset_to_baseunit=True)
-Q_ = ureg.Quantity
+Q_= ureg.Quantity
 
 # --- Pint Unit Options Setup ---
 PINT_UNIT_OPTIONS = {
@@ -779,6 +779,43 @@ class ThermodynamicsCalculator:
             
         return results
 
+    def calculate_humid_air_from_inputs(self, in1_code, val1, in2_code, val2, p_pa, outputs=None):
+        """
+        General-purpose humid-air calculation using any two properties + pressure.
+        in1_code/in2_code: one of ('Tdb','RH','W','H','Tdp','Twb') or HAPropsSI keys ('T','R','W','H','Tdp','Twb')
+        val1/val2: numeric values in SI-compatible units (temperatures in K, enthalpy in J/kg, W in kg/kg, RH fraction 0-1)
+        p_pa: pressure in Pa
+        outputs: optional list of desired output keys (HAPropsSI keys). If None, common outputs are returned.
+        Returns: {'properties': {key: value_or_None}, 'error': str|None}
+        """
+        res = {'properties': {}, 'error': None}
+        try:
+            map_in = {'Tdb': 'T', 'RH': 'R', 'W': 'W', 'H': 'H', 'Tdp': 'Tdp', 'Twb': 'Twb', 'T': 'T', 'R': 'R'}
+            i1 = map_in.get(in1_code, in1_code)
+            i2 = map_in.get(in2_code, in2_code)
+            if i1 == i2:
+                raise ValueError('Input properties must be different')
+            if outputs is None:
+                outputs = ['T', 'R', 'W', 'H', 'Tdp', 'Twb', 'V']
+            props = {}
+            for key in outputs:
+                if key == i1:
+                    props[key] = val1
+                    continue
+                if key == i2:
+                    props[key] = val2
+                    continue
+                try:
+                    v = CP.HAPropsSI(key, i1, val1, i2, val2, 'P', p_pa)
+                    props[key] = v
+                except Exception as e:
+                    logging.debug(f"HAPropsSI could not compute {key} from {i1}={val1}, {i2}={val2}: {e}")
+                    props[key] = None
+            res['properties'] = props
+        except Exception as e:
+            res['error'] = str(e)
+        return res
+
     def calculate_mixed_air(self, mdot1, t1_k, rh1, mdot2, t2_k, rh2, p_pa):
         """Mix two moist air streams.
         mdot1, mdot2: mass flow of moist air [kg/s]
@@ -1022,6 +1059,12 @@ class CoolPropApp(tk.Tk):
         self.psychro_tdb_var = tk.StringVar(value="25") # degC
         self.psychro_rh_var = tk.StringVar(value="50") # %
         self.psychro_p_var = tk.StringVar(value="101.325") # kPa
+        # Advanced psychrometric input (allow any two properties)
+        self.psychro_input_options = ['Tdb', 'RH', 'W', 'H', 'Tdp', 'Twb']
+        self.psychro_in1_prop_var = tk.StringVar(value='Tdb')
+        self.psychro_in1_value_var = tk.StringVar(value='25')
+        self.psychro_in2_prop_var = tk.StringVar(value='RH')
+        self.psychro_in2_value_var = tk.StringVar(value='50')
         # Psychro chart settings and mix history
         self.psychro_chart_tmin_var = tk.StringVar(value='-10')
         self.psychro_chart_tmax_var = tk.StringVar(value='50')
@@ -1335,11 +1378,260 @@ class CoolPropApp(tk.Tk):
         self.psat_canvas_widget.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
         self.psat_toolbar_frame.grid(row=1, column=0, sticky="ew", padx=5, pady=(0,5))
 
+    # --- Plot interaction: crosshair, tooltip, click-to-calc ---
+    def _init_plot_interactions(self):
+        # ph interactions
+        try:
+            self.ph_vline = None; self.ph_hline = None; self.ph_annotation = None; self.ph_last_query = 0.0
+            self.ph_cid_motion = self.ph_canvas.mpl_connect('motion_notify_event', self._on_ph_motion)
+            self.ph_cid_click = self.ph_canvas.mpl_connect('button_press_event', self._on_ph_click)
+        except Exception:
+            logging.debug('P-h canvas not ready for interactions')
+        # ts interactions
+        try:
+            self.ts_vline = None; self.ts_hline = None; self.ts_annotation = None; self.ts_last_query = 0.0
+            self.ts_cid_motion = self.ts_canvas.mpl_connect('motion_notify_event', self._on_ts_motion)
+            self.ts_cid_click = self.ts_canvas.mpl_connect('button_press_event', self._on_ts_click)
+        except Exception:
+            logging.debug('T-s canvas not ready for interactions')
+
+    def _on_ph_motion(self, event):
+        try:
+            if event.inaxes != self.ph_ax or event.xdata is None or event.ydata is None:
+                # clear crosshair/annotation when leaving axes
+                self._clear_ph_interaction()
+                return
+            h_kj = float(event.xdata); p_kpa = float(event.ydata)
+            # draw/update crosshair lines
+            if getattr(self, 'ph_vline', None) is None:
+                try:
+                    self.ph_vline = self.ph_ax.axvline(h_kj, color='black', lw=0.6, ls='--', zorder=50)
+                    self.ph_hline = self.ph_ax.axhline(p_kpa, color='black', lw=0.6, ls='--', zorder=50)
+                except Exception:
+                    return
+            else:
+                try:
+                    self.ph_vline.set_xdata([h_kj, h_kj]); self.ph_hline.set_ydata([p_kpa, p_kpa])
+                except Exception:
+                    pass
+            # Throttle property queries to ~5-10 Hz
+            now = time.time()
+            if now - getattr(self, 'ph_last_query', 0.0) < 0.12:
+                try: self.ph_canvas.draw_idle()
+                except: pass
+                return
+            self.ph_last_query = now
+            # Query CoolProp for T and S at (P,H)
+            fluid = self.fluid_var.get()
+            try:
+                p_si = p_kpa * 1000.0; h_si = h_kj * 1000.0
+                res = self.calculator.calculate_properties(fluid, 'P', p_si, 'H', h_si, ['P', 'H', 'T', 'S'])
+            except Exception:
+                res = None
+            # format tooltip text
+            txt = f"h={h_kj:.3f} kJ/kg\nP={p_kpa:.3f} kPa"
+            if res and isinstance(res.get('values'), dict):
+                vals = res.get('values')
+                try:
+                    T_si = vals.get('T'); S_si = vals.get('S')
+                    if isinstance(T_si, (int, float)):
+                        Tdisp = self.Q_(T_si, 'K').to('degC').m
+                        txt += f"\nT={Tdisp:.2f} °C"
+                    if isinstance(S_si, (int, float)):
+                        Sdisp = self.Q_(S_si, 'J/(kg*K)').to('kJ/(kg*K)').m
+                        txt += f"\ns={Sdisp:.4f} kJ/(kg*K)"
+                except Exception:
+                    pass
+            # update annotation
+            try:
+                if getattr(self, 'ph_annotation', None) is None:
+                    self.ph_annotation = self.ph_ax.annotate(txt, xy=(h_kj, p_kpa), xytext=(15, 15), textcoords='offset points', bbox=dict(boxstyle='round', fc='w', alpha=0.8), fontsize=8, zorder=60)
+                else:
+                    self.ph_annotation.set_text(txt); self.ph_annotation.xy = (h_kj, p_kpa)
+                try: self.ph_canvas.draw_idle()
+                except: pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _on_ph_click(self, event):
+        try:
+            if event.inaxes != self.ph_ax or event.button != 1 or event.xdata is None or event.ydata is None:
+                return
+            h_kj = float(event.xdata); p_kpa = float(event.ydata)
+            fluid = self.fluid_var.get()
+            p_si = p_kpa * 1000.0; h_si = h_kj * 1000.0
+            try:
+                res = self.calculator.calculate_properties(fluid, 'P', p_si, 'H', h_si, ['P', 'H', 'T', 'S'])
+            except Exception as e:
+                messagebox.showerror('Point Capture', f'Could not calculate properties at point:\n{e}', parent=self)
+                return
+            if not res or res.get('error'):
+                messagebox.showerror('Point Capture', f'Calculation error: {res.get("error")}', parent=self)
+                return
+            # Populate main calculator with P and H (prefer kPa and kJ/kg)
+            try:
+                p_display = self.Q_(p_si, 'Pa').to('kPa').m
+                h_display = self.Q_(h_si, 'J/kg').to('kJ/kg').m
+                # set prop1 = P, prop2 = H (keep user-friendly units)
+                disp_p = self.code_to_display_map.get('P', 'Pressure'); disp_h = self.code_to_display_map.get('H', 'SpecificEnergy')
+                self.prop1_name_var.set(disp_p); self._update_unit_options();
+                if 'kPa' in self.prop1_unit_combo['values']:
+                    self.prop1_unit_var.set('kPa')
+                    self.prop1_value_var.set(f"{p_display:.6g}")
+                else:
+                    # fallback to SI Pa
+                    self.prop1_unit_var.set(self.prop1_unit_combo['values'][0] if self.prop1_unit_combo['values'] else 'pascal')
+                    self.prop1_value_var.set(f"{p_si:.6g}")
+                self.prop2_name_var.set(self.code_to_display_map.get('H', 'SpecificEnergy')); self._update_unit_options();
+                if any('kJ' in u for u in self.prop2_unit_combo['values']):
+                    # prefer kJ/kg
+                    chosen = next((u for u in self.prop2_unit_combo['values'] if 'kJ' in u), self.prop2_unit_combo['values'][0])
+                    self.prop2_unit_var.set(chosen)
+                    self.prop2_value_var.set(f"{h_display:.6g}")
+                else:
+                    self.prop2_unit_var.set(self.prop2_unit_combo['values'][0] if self.prop2_unit_combo['values'] else 'J/kg')
+                    self.prop2_value_var.set(f"{h_si:.6g}")
+                # switch to calculator tab so user sees populated values
+                try: self.notebook.select(self.calculator_tab)
+                except Exception: pass
+            except Exception as e:
+                logging.error(f"Failed to populate calculator from P-h click: {e}", exc_info=True)
+        except Exception:
+            pass
+
+    def _clear_ph_interaction(self):
+        try:
+            if getattr(self, 'ph_annotation', None):
+                try: self.ph_annotation.remove()
+                except Exception: pass
+                self.ph_annotation = None
+            if getattr(self, 'ph_vline', None):
+                try: self.ph_vline.remove(); self.ph_vline = None
+                except Exception: self.ph_vline = None
+            if getattr(self, 'ph_hline', None):
+                try: self.ph_hline.remove(); self.ph_hline = None
+                except Exception: self.ph_hline = None
+            try: self.ph_canvas.draw_idle()
+            except: pass
+        except Exception:
+            pass
+
+    def _on_ts_motion(self, event):
+        try:
+            if event.inaxes != self.ts_ax or event.xdata is None or event.ydata is None:
+                self._clear_ts_interaction()
+                return
+            s_kj = float(event.xdata); t_k = float(event.ydata)
+            if getattr(self, 'ts_vline', None) is None:
+                try:
+                    self.ts_vline = self.ts_ax.axvline(s_kj, color='black', lw=0.6, ls='--', zorder=50)
+                    self.ts_hline = self.ts_ax.axhline(t_k, color='black', lw=0.6, ls='--', zorder=50)
+                except Exception:
+                    return
+            else:
+                try: self.ts_vline.set_xdata([s_kj, s_kj]); self.ts_hline.set_ydata([t_k, t_k])
+                except Exception: pass
+            now = time.time()
+            if now - getattr(self, 'ts_last_query', 0.0) < 0.12:
+                try: self.ts_canvas.draw_idle()
+                except: pass
+                return
+            self.ts_last_query = now
+            fluid = self.fluid_var.get()
+            try:
+                t_si = t_k; s_si = s_kj * 1000.0
+                res = self.calculator.calculate_properties(fluid, 'T', t_si, 'S', s_si, ['P', 'H', 'T', 'S'])
+            except Exception:
+                res = None
+            txt = f"s={s_kj:.4f} kJ/(kg*K)\nT={t_k:.2f} K"
+            if res and isinstance(res.get('values'), dict):
+                vals = res.get('values')
+                try:
+                    P_si = vals.get('P'); H_si = vals.get('H')
+                    if isinstance(P_si, (int, float)):
+                        Pdisp = self.Q_(P_si, 'Pa').to('kPa').m
+                        txt += f"\nP={Pdisp:.3f} kPa"
+                    if isinstance(H_si, (int, float)):
+                        Hdisp = self.Q_(H_si, 'J/kg').to('kJ/kg').m
+                        txt += f"\nh={Hdisp:.3f} kJ/kg"
+                except Exception:
+                    pass
+            try:
+                if getattr(self, 'ts_annotation', None) is None:
+                    self.ts_annotation = self.ts_ax.annotate(txt, xy=(s_kj, t_k), xytext=(15, 15), textcoords='offset points', bbox=dict(boxstyle='round', fc='w', alpha=0.8), fontsize=8, zorder=60)
+                else:
+                    self.ts_annotation.set_text(txt); self.ts_annotation.xy = (s_kj, t_k)
+                try: self.ts_canvas.draw_idle()
+                except: pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _on_ts_click(self, event):
+        try:
+            if event.inaxes != self.ts_ax or event.button != 1 or event.xdata is None or event.ydata is None:
+                return
+            s_kj = float(event.xdata); t_k = float(event.ydata)
+            fluid = self.fluid_var.get()
+            try:
+                res = self.calculator.calculate_properties(fluid, 'T', t_k, 'S', s_kj*1000.0, ['P', 'H', 'T', 'S'])
+            except Exception as e:
+                messagebox.showerror('Point Capture', f'Could not calculate properties at point:\n{e}', parent=self); return
+            if not res or res.get('error'):
+                messagebox.showerror('Point Capture', f'Calculation error: {res.get("error")}', parent=self); return
+            vals = res.get('values', {})
+            P_si = vals.get('P'); H_si = vals.get('H')
+            try:
+                # populate calculator with P and H like for P-h click
+                p_display = self.Q_(P_si, 'Pa').to('kPa').m if isinstance(P_si, (int, float)) else None
+                h_display = self.Q_(H_si, 'J/kg').to('kJ/kg').m if isinstance(H_si, (int, float)) else None
+                self.prop1_name_var.set(self.code_to_display_map.get('P', 'Pressure')); self._update_unit_options()
+                if p_display is not None and 'kPa' in self.prop1_unit_combo['values']:
+                    self.prop1_unit_var.set('kPa'); self.prop1_value_var.set(f"{p_display:.6g}")
+                else:
+                    self.prop1_unit_var.set(self.prop1_unit_combo['values'][0] if self.prop1_unit_combo['values'] else 'pascal'); self.prop1_value_var.set(f"{P_si:.6g}")
+                self.prop2_name_var.set(self.code_to_display_map.get('H', 'SpecificEnergy')); self._update_unit_options()
+                if h_display is not None and any('kJ' in u for u in self.prop2_unit_combo['values']):
+                    chosen = next((u for u in self.prop2_unit_combo['values'] if 'kJ' in u), self.prop2_unit_combo['values'][0]); self.prop2_unit_var.set(chosen); self.prop2_value_var.set(f"{h_display:.6g}")
+                else:
+                    self.prop2_unit_var.set(self.prop2_unit_combo['values'][0] if self.prop2_unit_combo['values'] else 'J/kg'); self.prop2_value_var.set(f"{H_si:.6g}")
+                try: self.notebook.select(self.calculator_tab)
+                except Exception: pass
+            except Exception as e:
+                logging.error(f"Failed to populate calculator from T-s click: {e}", exc_info=True)
+        except Exception:
+            pass
+
+    def _clear_ts_interaction(self):
+        try:
+            if getattr(self, 'ts_annotation', None):
+                try: self.ts_annotation.remove()
+                except Exception: pass
+                self.ts_annotation = None
+            if getattr(self, 'ts_vline', None):
+                try: self.ts_vline.remove(); self.ts_vline = None
+                except Exception: self.ts_vline = None
+            if getattr(self, 'ts_hline', None):
+                try: self.ts_hline.remove(); self.ts_hline = None
+                except Exception: self.ts_hline = None
+            try: self.ts_canvas.draw_idle()
+            except: pass
+        except Exception:
+            pass
+
     def _bind_events(self):
         self.fluid_filter_entry.bind("<KeyRelease>", self._filter_fluid_list); self.fluid_listbox.bind("<Double-Button-1>", self._on_fluid_select_from_list)
         self.prop1_name_combo.bind("<<ComboboxSelected>>", self._update_unit_options); self.prop2_name_combo.bind("<<ComboboxSelected>>", self._update_unit_options)
         self.prop1_value_entry.bind("<Return>", lambda e: self._calculate_property_orchestrator()); self.prop2_value_entry.bind("<Return>", lambda e: self._calculate_property_orchestrator())
         self.calculate_button.bind("<Return>", lambda e: self._calculate_property_orchestrator()); self.output_listbox.bind("<Double-Button-1>", lambda e: self._calculate_property_orchestrator())
+        # Initialize interactive plot handlers (crosshair, tooltip, click-to-calc)
+        try:
+            self._init_plot_interactions()
+        except Exception:
+            logging.info('Plot interaction initialization skipped (plots may not be ready).')
     def _initial_state_setup(self):
         logging.info(f"Initializing CoolPropApp v{APP_VERSION}")
         self._update_unit_options(event=None)
@@ -2675,20 +2967,43 @@ class CoolPropApp(tk.Tk):
         input_frame.grid(row=0, column=0, padx=5, pady=5, sticky="new")
         input_frame.grid_columnconfigure(1, weight=1)
 
-        # Dry Bulb Temp
-        ttk.Label(input_frame, text="Dry Bulb Temp (Tdb):").grid(row=0, column=0, padx=5, pady=3, sticky="w")
-        ttk.Entry(input_frame, textvariable=self.psychro_tdb_var, width=10).grid(row=0, column=1, padx=5, pady=3, sticky="ew")
-        ttk.Label(input_frame, text="°C").grid(row=0, column=2, padx=(0,5), pady=3, sticky="w")
+        # Flexible Input 1 (allows Tdb, RH, W, H, Tdp, Twb)
+        ttk.Label(input_frame, text="Input 1:").grid(row=0, column=0, padx=5, pady=3, sticky="w")
+        self.psychro_in1_combo = ttk.Combobox(input_frame, values=self.psychro_input_options, textvariable=self.psychro_in1_prop_var, state='readonly', width=10)
+        self.psychro_in1_combo.grid(row=0, column=1, padx=5, pady=3, sticky="w")
+        self.psychro_in1_value_entry = ttk.Entry(input_frame, textvariable=self.psychro_in1_value_var, width=12)
+        self.psychro_in1_value_entry.grid(row=0, column=2, padx=5, pady=3, sticky="w")
+        self.psychro_in1_unit_label = ttk.Label(input_frame, text="°C")
+        self.psychro_in1_unit_label.grid(row=0, column=3, padx=(0,5), pady=3, sticky="w")
 
-        # Relative Humidity
-        ttk.Label(input_frame, text="Relative Humidity (RH):").grid(row=1, column=0, padx=5, pady=3, sticky="w")
-        ttk.Entry(input_frame, textvariable=self.psychro_rh_var, width=10).grid(row=1, column=1, padx=5, pady=3, sticky="ew")
-        ttk.Label(input_frame, text="%").grid(row=1, column=2, padx=(0,5), pady=3, sticky="w")
+        # Flexible Input 2
+        ttk.Label(input_frame, text="Input 2:").grid(row=1, column=0, padx=5, pady=3, sticky="w")
+        self.psychro_in2_combo = ttk.Combobox(input_frame, values=self.psychro_input_options, textvariable=self.psychro_in2_prop_var, state='readonly', width=10)
+        self.psychro_in2_combo.grid(row=1, column=1, padx=5, pady=3, sticky="w")
+        self.psychro_in2_value_entry = ttk.Entry(input_frame, textvariable=self.psychro_in2_value_var, width=12)
+        self.psychro_in2_value_entry.grid(row=1, column=2, padx=5, pady=3, sticky="w")
+        self.psychro_in2_unit_label = ttk.Label(input_frame, text="%")
+        self.psychro_in2_unit_label.grid(row=1, column=3, padx=(0,5), pady=3, sticky="w")
 
-        # Atmospheric Pressure
+        # Atmospheric Pressure (same as before)
         ttk.Label(input_frame, text="Atm. Pressure (Patm):").grid(row=2, column=0, padx=5, pady=3, sticky="w")
         ttk.Entry(input_frame, textvariable=self.psychro_p_var, width=10).grid(row=2, column=1, padx=5, pady=3, sticky="ew")
         ttk.Label(input_frame, text="kPa").grid(row=2, column=2, padx=(0,5), pady=3, sticky="w")
+
+        # Update unit labels when selection changes
+        def _update_psychro_units(event=None):
+            try:
+                m = {'Tdb': '°C', 'Tdp': '°C', 'Twb': '°C', 'RH': '%', 'W': 'kg/kg', 'H': 'kJ/kg'}
+                self.psychro_in1_unit_label.config(text=m.get(self.psychro_in1_prop_var.get(), ''))
+                self.psychro_in2_unit_label.config(text=m.get(self.psychro_in2_prop_var.get(), ''))
+            except Exception:
+                pass
+
+        self.psychro_in1_combo.bind('<<ComboboxSelected>>', _update_psychro_units)
+        self.psychro_in2_combo.bind('<<ComboboxSelected>>', _update_psychro_units)
+        # initialize unit labels
+        try: _update_psychro_units()
+        except: pass
 
         # Calculate Button
         calc_btn = ttk.Button(input_frame, text="Calculate Properties", command=self._calculate_psychro_orchestrator)
@@ -2754,15 +3069,30 @@ class CoolPropApp(tk.Tk):
         for item in self.psychro_tree.get_children(): self.psychro_tree.delete(item)
 
         try:
-            # Get & Convert Inputs
-            t_db_c = float(self.psychro_tdb_var.get())
-            rh_percent = float(self.psychro_rh_var.get())
+            # Read flexible inputs
+            in1_code = self.psychro_in1_prop_var.get()
+            in2_code = self.psychro_in2_prop_var.get()
+            in1_str = self.psychro_in1_value_var.get()
+            in2_str = self.psychro_in2_value_var.get()
             p_kpa = float(self.psychro_p_var.get())
-
-            t_db_k = self.Q_(t_db_c, 'degC').to('K').m
-            rh_frac = rh_percent / 100.0
             p_pa = self.Q_(p_kpa, 'kPa').to('Pa').m
+            # convert inputs to SI expected by HAPropsSI
+            def _to_si(prop, s):
+                if s is None or s == '': raise ValueError(f'Missing value for {prop}')
+                if prop in ('Tdb', 'Tdp', 'Twb', 'T'):
+                    return self.Q_(float(s), 'degC').to('K').m
+                if prop in ('RH', 'R'):
+                    return float(s) / 100.0
+                if prop == 'H':
+                    # accept kJ/kg input
+                    return self.Q_(float(s), 'kJ/kg').to('J/kg').m
+                if prop == 'W':
+                    return float(s)
+                # default: try numeric
+                return float(s)
 
+            val1_si = _to_si(in1_code, in1_str)
+            val2_si = _to_si(in2_code, in2_str)
         except ValueError as ve:
             messagebox.showerror("Input Error", f"Invalid numeric input: {ve}", parent=self); return
         except Exception as e:
@@ -2780,44 +3110,60 @@ class CoolPropApp(tk.Tk):
                 except Exception: pass
                 return
             props = res.get('properties', {})
+            # Display results in tree
+            try:
+                # clear existing tree
+                for it in self.psychro_tree.get_children(): self.psychro_tree.delete(it)
+            except Exception:
+                pass
             display_map = {
+                'T': ('Dry Bulb Temp', 'degC', '.2f'),
                 'Tdp': ('Dew Point Temp', 'degC', '.2f'),
                 'Twb': ('Wet Bulb Temp', 'degC', '.2f'),
-                'W':   ('Humidity Ratio', 'dimensionless', '.5f'),
-                'H':   ('Specific Enthalpy', 'kJ/kg', '.2f'),
-                'V':   ('Specific Volume', 'm**3/kg', '.4f'),
-                'M':   ('Viscosity', 'Pa*s', '.2f'),
-                'K':   ('Conductivity', 'W/(m*K)', '.4f')
+                'R': ('Relative Humidity', '%', '.2f'),
+                'W': ('Humidity Ratio', 'kg/kg', '.5f'),
+                'H': ('Specific Enthalpy', 'kJ/kg', '.2f'),
+                'V': ('Specific Volume', 'm**3/kg', '.4f')
             }
             try:
-                for key, val in props.items():
+                for key in ['T','R','W','H','Tdp','Twb','V']:
+                    val = props.get(key)
                     if val is None: continue
                     desc, unit_str, fmt = display_map.get(key, (key, '', '.4f'))
                     try:
-                        si_unit = 'K' if key in ['Tdp', 'Twb'] else ('J/kg' if key=='H' else ('m**3/kg' if key=='V' else ('Pa*s' if key=='M' else ('W/(m*K)' if key=='K' else 'dimensionless'))))
-                        qty = self.Q_(val, si_unit)
-                        if key == 'W':
+                        if key == 'R':
+                            disp_val = f"{val*100:{fmt}}"
+                            disp_unit = '%'
+                        elif key == 'W':
                             disp_val = f"{val:{fmt}}"
-                            disp_unit = "kg_w/kg_da"
+                            disp_unit = 'kg/kg'
+                        elif key == 'H':
+                            qty = self.Q_(val, 'J/kg').to('kJ/kg')
+                            disp_val = f"{qty.magnitude:{fmt}}"
+                            disp_unit = f"{qty.units:~P}"
+                        elif key in ('T','Tdp','Twb'):
+                            qty = self.Q_(val, 'K').to('degC')
+                            disp_val = f"{qty.magnitude:{fmt}}"
+                            disp_unit = '°C'
                         else:
-                            qty_conv = qty.to(unit_str)
-                            disp_val = f"{qty_conv.magnitude:{fmt}}"
-                            disp_unit = f"{qty_conv.units:~P}"
+                            # generic
+                            disp_val = f"{val:{fmt}}"
+                            disp_unit = unit_str
                         self.psychro_tree.insert('', tk.END, values=(desc, disp_val, disp_unit))
                     except Exception as e:
                         logging.error(f"Formatting error for {key}: {e}")
-                        self.psychro_tree.insert('', tk.END, values=(desc, str(val), "Error"))
+                        self.psychro_tree.insert('', tk.END, values=(desc, str(val), ""))
             except Exception as e:
                 logging.error(f"Error updating psychro display: {e}", exc_info=True)
 
-        # Run calculation in background
+        # Async call to general humid-air calculator
         try:
-            self._run_task_async(self.calculator.calculate_humid_air_properties, args=(t_db_k, rh_frac, p_pa), on_done=_on_psychro_done, title='Calculating humid air properties')
+            self._run_task_async(self.calculator.calculate_humid_air_from_inputs, args=(in1_code, val1_si, in2_code, val2_si, p_pa), on_done=_on_psychro_done, title='Calculating humid air properties')
         except Exception as e:
             logging.error(f"Failed to start async psychro task: {e}", exc_info=True)
             # fallback synchronous
             try:
-                res = self.calculator.calculate_humid_air_properties(t_db_k, rh_frac, p_pa)
+                res = self.calculator.calculate_humid_air_from_inputs(in1_code, val1_si, in2_code, val2_si, p_pa)
                 _on_psychro_done(res, None)
             except Exception as ee:
                 logging.error(f"Psychro fallback failed: {ee}", exc_info=True); messagebox.showerror('Psychro Error', f'Could not calculate: {ee}', parent=self)
@@ -3010,6 +3356,36 @@ class CoolPropApp(tk.Tk):
                 # Overlay toggles
                 ttk.Checkbutton(ctl_frame, text='Show Enthalpy Annotations', variable=self.psychro_show_enthalpy_var, onvalue=True, offvalue=False).pack(side=tk.LEFT, padx=6)
                 ttk.Checkbutton(ctl_frame, text='Show Wet-Bulb Annotations', variable=self.psychro_show_wetbulb_var, onvalue=True, offvalue=False).pack(side=tk.LEFT, padx=6)
+
+                # Save buttons
+                def _save_png():
+                    try:
+                        filename = filedialog.asksaveasfilename(defaultextension='.png', filetypes=[('PNG files','*.png')], initialfile=f'psychro_{p_kpa:.0f}kPa.png', parent=top)
+                        if not filename: return
+                        fig.savefig(filename, dpi=200)
+                        messagebox.showinfo('Save', f'Chart saved to {filename}', parent=top)
+                    except Exception as e:
+                        logging.error(f'Failed to save PNG: {e}', exc_info=True); messagebox.showerror('Save Error', f'Could not save PNG: {e}', parent=top)
+
+                def _save_csv():
+                    try:
+                        filename = filedialog.asksaveasfilename(defaultextension='.csv', filetypes=[('CSV files','*.csv')], initialfile=f'psychro_{p_kpa:.0f}kPa.csv', parent=top)
+                        if not filename: return
+                        with open(filename, 'w', newline='', encoding='utf-8') as f:
+                            w = csv.writer(f)
+                            w.writerow(['rh_fraction', 'T_C', 'W_kgkg'])
+                            for rh, (T_c, W) in data['rh_lines'].items():
+                                for Tc, Wv in zip(T_c, W):
+                                    if np.isfinite(Wv):
+                                        w.writerow([f"{rh:.6f}", f"{Tc:.6f}", f"{Wv:.6e}"])
+                        messagebox.showinfo('Save', f'Data saved to {filename}', parent=top)
+                    except Exception as e:
+                        logging.error(f'Failed to save CSV: {e}', exc_info=True); messagebox.showerror('Save Error', f'Could not save CSV: {e}', parent=top)
+
+                save_png_btn = ttk.Button(ctl_frame, text='Save PNG', command=_save_png)
+                save_png_btn.pack(side=tk.RIGHT, padx=6)
+                save_csv_btn = ttk.Button(ctl_frame, text='Save CSV', command=_save_csv)
+                save_csv_btn.pack(side=tk.RIGHT, padx=6)
 
                 canvas = FigureCanvasTkAgg(fig, master=top); canvas.get_tk_widget().pack(fill='both', expand=True)
                 canvas.draw()
