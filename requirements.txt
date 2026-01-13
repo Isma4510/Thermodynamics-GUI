@@ -1,0 +1,4 @@
+CoolProp
+pint
+numpy
+matplotlib

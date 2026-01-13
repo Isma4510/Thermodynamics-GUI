@@ -1,0 +1,22 @@
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.env
+
+# Distribution / Installer
+dist/
+build/
+*.spec
+*.app/
+*.exe
+*.pkg
+*.dmg
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
