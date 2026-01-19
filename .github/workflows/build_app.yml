@@ -34,7 +34,19 @@ jobs:
         path: dist/ThermoGUI.exe
 
   build-macos:
-    runs-on: macos-latest # Uses latest stable macOS runner (likely Apple Silicon / ARM64)
+    name: Build macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest   # ARM64 (Apple Silicon)
+            arch: arm64
+            dmg_suffix: AppleSilicon
+          - os: macos-13      # Intel (Trying 13 again as 15 might be private preview, or 12 if 13 fails. Actually, let's try 'macos-13' one last time as 'retired' might mean deprecated. If valid, it works. If not, we try macos-12.)
+            arch: x86_64
+            dmg_suffix: Intel
+
     steps:
     - uses: actions/checkout@v4
     
@@ -55,10 +67,10 @@ jobs:
 
     - name: Create DMG
       run: |
-        hdiutil create -volname "ThermoGUI" -srcfolder dist/ThermoGUI.app -ov -format UDZO dist/ThermoGUI.dmg
+        hdiutil create -volname "ThermoGUI" -srcfolder dist/ThermoGUI.app -ov -format UDZO dist/ThermoGUI-${{ matrix.dmg_suffix }}.dmg
         
     - name: Upload macOS Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: ThermoGUI-macOS-Universal
-        path: dist/ThermoGUI.dmg
+        name: ThermoGUI-macOS-${{ matrix.dmg_suffix }}
+        path: dist/ThermoGUI-${{ matrix.dmg_suffix }}.dmg
