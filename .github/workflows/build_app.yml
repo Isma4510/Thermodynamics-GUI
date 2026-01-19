@@ -52,9 +52,13 @@ jobs:
     - name: Build with PyInstaller
       run: |
         pyinstaller --noconfirm --onefile --windowed --name "ThermoGUI" --add-data "coolprop_gui_config.ini:." coolprop_gui.py
+
+    - name: Create DMG
+      run: |
+        hdiutil create -volname "ThermoGUI" -srcfolder dist/ThermoGUI.app -ov -format UDZO dist/ThermoGUI.dmg
         
     - name: Upload macOS Artifact
       uses: actions/upload-artifact@v4
       with:
         name: ThermoGUI-macOS-Universal
-        path: dist/ThermoGUI.app
+        path: dist/ThermoGUI.dmg
