@@ -34,7 +34,7 @@ jobs:
         path: dist/ThermoGUI.exe
 
   build-macos:
-    runs-on: macos-13 # Uses Intel runner for maximum compatibility (Runs on Intel + Apple Silicon via Rosetta)
+    runs-on: macos-latest # Uses latest stable macOS runner (likely Apple Silicon / ARM64)
     steps:
     - uses: actions/checkout@v4
     
